@@ -76,6 +76,30 @@ _CLAUDE_ID_RE = re.compile(
 # Slugs on the OpenRouter side that are Claude models (either derived from an
 # Anthropic id above, or listed verbatim by the live catalog).
 _OPENROUTER_CLAUDE_PREFIX = "anthropic/claude-"
+_HAIKU_FAMILY = "haiku"
+
+
+def model_supports_deep_reasoning(model: str) -> bool:
+    """Whether the "Deep reasoning" toggle may add thinking fields for ``model``.
+
+    Haiku is the one Claude family that rejects adaptive thinking and the
+    ``output_config.effort`` field outright (HTTP 400 from Anthropic), so it
+    is excluded whether addressed by its Anthropic id or its OpenRouter slug,
+    in current or legacy naming. The check is scoped to Claude names, so an
+    unrelated slug that merely contains "haiku" keeps deep reasoning. Everything else is allowed
+    here; the provider feature gate then drops the fields for models that
+    can't actually reason, so a wrong guess costs nothing. Mirrors the
+    Council UI guard.
+    """
+    lowered = model.lower()
+    is_claude_name = lowered.startswith("claude-") or lowered.startswith(
+        _OPENROUTER_CLAUDE_PREFIX
+    )
+    # Scoped substring: only a Claude id / slug can be Haiku, but within that
+    # namespace the family may sit first (``claude-haiku-4-5``,
+    # ``anthropic/claude-haiku-4.5``) or last (legacy
+    # ``claude-3-5-haiku-20241022``, ``anthropic/claude-3.5-haiku``).
+    return not (is_claude_name and _HAIKU_FAMILY in lowered)
 
 
 def openrouter_slug_for_claude(model: str) -> str | None:
@@ -112,6 +136,17 @@ _CLAUDE_FEATURE_SPEC = FeatureSpec(
 _DEFAULT_NON_CLAUDE_SPEC = FeatureSpec(
     supports_cache_control=False,
     supports_thinking=False,
+    supports_web_search=False,
+    supports_tool_use=True,
+)
+
+# Non-Claude model whose live catalog entry advertises ``reasoning``
+# support: keep the Anthropic ``thinking`` / ``output_config`` fields so the
+# translator can turn them into OpenRouter's ``reasoning`` parameter. Cache
+# and web-search stay off — those really are Anthropic-only.
+_NON_CLAUDE_REASONING_SPEC = FeatureSpec(
+    supports_cache_control=False,
+    supports_thinking=True,
     supports_web_search=False,
     supports_tool_use=True,
 )
@@ -194,6 +229,8 @@ def _openrouter_model_resolver(model: str) -> tuple[str, FeatureSpec] | None:
     * Verbatim Claude slug from the catalog (``anthropic/claude-opus-4.8``) →
       unchanged, Claude spec — OpenRouter forwards cache_control / thinking
       to Anthropic for these, so stripping them would only cost money.
+    * Non-Claude slug the catalog marks reasoning-capable → unchanged,
+      thinking kept (translated to OpenRouter ``reasoning``), rest stripped.
     * Anything else → None; the provider applies the non-Claude default.
     """
     slug = openrouter_slug_for_claude(model)
@@ -201,6 +238,11 @@ def _openrouter_model_resolver(model: str) -> tuple[str, FeatureSpec] | None:
         return slug, _CLAUDE_FEATURE_SPEC
     if model.startswith(_OPENROUTER_CLAUDE_PREFIX):
         return model, _CLAUDE_FEATURE_SPEC
+    # Non-Claude: the live catalog knows whether OpenRouter will honour a
+    # ``reasoning`` request for this slug. Unknown (fallback list, or a slug
+    # outside the catalog) keeps the conservative thinking-off default.
+    if openrouter_catalog.supports_reasoning(model):
+        return model, _NON_CLAUDE_REASONING_SPEC
     return None
 
 

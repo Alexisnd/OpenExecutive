@@ -286,11 +286,14 @@ class Settings(BaseSettings):
     # full-pass revision on top of the draft, typically 5–12s.
     committee_extra_timeout_s: float = Field(60.0, alias="COMMITTEE_EXTRA_TIMEOUT_S")
 
-    # Reasoning effort for deep-reasoning specialists. Opus 4.7 only supports
-    # `thinking.type=adaptive` paired with `output_config.effort`. Valid
-    # values: "low", "medium", "high", "xhigh", "max". `low` is ~3x faster
-    # and much cheaper; bump to `medium` when answers feel shallow.
-    specialist_effort: str = Field("low", alias="SPECIALIST_EFFORT")
+    # Reasoning effort for deep-reasoning specialists (adaptive thinking +
+    # `output_config.effort`; translated to OpenRouter `reasoning.effort` on
+    # that path). Validated at boot: an invalid value used to 400 on Anthropic
+    # direct and would otherwise be silently coerced on OpenRouter. `low` is
+    # ~3x faster and much cheaper; bump to `medium` when answers feel shallow.
+    specialist_effort: Literal["low", "medium", "high", "xhigh", "max"] = Field(
+        "low", alias="SPECIALIST_EFFORT"
+    )
 
     @model_validator(mode="after")
     def _resolve_paths(self) -> "Settings":
