@@ -63,6 +63,11 @@ _SLUG_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}/[A-Za-z0-9._-]{1,96}$")
 # filter matched nothing) and is served as-is so a misconfigured allowlist
 # is visible rather than silently masked by the fallback.
 _loaded_models: list[str] | None = None
+# Subset of ``_loaded_models`` whose catalog entry advertises "reasoning" in
+# ``supported_parameters`` — i.e. OpenRouter will honour a ``reasoning``
+# request field for them. Drives the Council "Deep reasoning" checkbox for
+# non-Claude models.
+_loaded_reasoning: frozenset[str] = frozenset()
 _loaded_at: float | None = None
 
 
@@ -71,9 +76,40 @@ def loaded_models() -> list[str] | None:
     return None if _loaded_models is None else list(_loaded_models)
 
 
+def supports_reasoning(model_id: str) -> bool | None:
+    """Whether the loaded catalog says ``model_id`` accepts ``reasoning``.
+
+    ``None`` when no catalog is loaded or the slug isn't in it — callers
+    treat that as "unknown" and keep their conservative default.
+    """
+    if _loaded_models is None or model_id not in _loaded_models:
+        return None
+    return model_id in _loaded_reasoning
+
+
+def reasoning_capable_ids(entries: Iterable[Mapping[str, Any]]) -> frozenset[str]:
+    """Ids of catalog entries that list "reasoning" in ``supported_parameters``."""
+    out: set[str] = set()
+    for entry in entries:
+        model_id = entry.get("id")
+        if isinstance(model_id, str) and _advertises(entry, "reasoning"):
+            out.add(model_id)
+    return frozenset(out)
+
+
 def loaded_at() -> float | None:
     """``time.time()`` of the last successful fetch, for diagnostics."""
     return _loaded_at
+
+
+def _advertises(entry: Mapping[str, Any], parameter: str) -> bool:
+    """True iff ``supported_parameters`` is a list containing ``parameter``.
+
+    Strict on type: a string value would make ``in`` a substring test and
+    a dict a key test — remote data must not flip a capability that way.
+    """
+    params = entry.get("supported_parameters")
+    return isinstance(params, list) and parameter in params
 
 
 def _price(entry: Mapping[str, Any], key: str) -> float:
@@ -93,7 +129,7 @@ def _is_candidate(entry: Mapping[str, Any], providers: frozenset[str]) -> bool:
     provider, _, _rest = model_id.partition("/")
     if provider not in providers:
         return False
-    if "tools" not in (entry.get("supported_parameters") or []):
+    if not _advertises(entry, "tools"):
         return False
     arch = entry.get("architecture")
     outputs = arch.get("output_modalities") if isinstance(arch, Mapping) else None
@@ -194,7 +230,7 @@ async def refresh_openrouter_catalog(settings: Any) -> bool:
     Never raises: a failure logs a warning and leaves the previous cache
     (or the never-loaded state → registry fallback) untouched.
     """
-    global _loaded_models, _loaded_at
+    global _loaded_models, _loaded_reasoning, _loaded_at
     try:
         entries = await fetch_catalog(
             base_url=settings.openrouter_base_url,
@@ -215,12 +251,14 @@ async def refresh_openrouter_catalog(settings: Any) -> bool:
         )
         return False
     _loaded_models = models
+    _loaded_reasoning = reasoning_capable_ids(entries) & frozenset(models)
     _loaded_at = time.time()
     logger.info(
-        "OpenRouter catalog loaded: %d model(s) from %d catalog entries "
-        "(providers=%s, per_provider=%d)",
+        "OpenRouter catalog loaded: %d model(s) from %d catalog entries, "
+        "%d with reasoning support (providers=%s, per_provider=%d)",
         len(models),
         len(entries),
+        len(_loaded_reasoning),
         ",".join(settings.openrouter_catalog_providers),
         settings.openrouter_catalog_per_provider,
     )
@@ -247,6 +285,7 @@ async def run_catalog_refresher(settings: Any) -> None:
 
 
 def _reset_for_tests() -> None:
-    global _loaded_models, _loaded_at
+    global _loaded_models, _loaded_reasoning, _loaded_at
     _loaded_models = None
+    _loaded_reasoning = frozenset()
     _loaded_at = None

@@ -46,6 +46,23 @@ from openexecutive.providers.translator import (
 
 logger = logging.getLogger(__name__)
 
+# Slugs for which we've already announced that deep reasoning is being sent
+# through OpenRouter. Reasoning tokens are billed, and the Council toggle can
+# be on for an agent that was previously parked on a model where it was a
+# silent no-op — one log line per model per process makes that visible.
+_reasoning_announced: set[str] = set()
+
+
+def _announce_reasoning(slug: str, body: dict[str, Any]) -> None:
+    if "reasoning" in body and slug not in _reasoning_announced:
+        _reasoning_announced.add(slug)
+        logger.info(
+            "deep reasoning enabled for %s via OpenAI-compatible backend "
+            "(reasoning=%s); reasoning tokens are billed for this model",
+            slug,
+            body["reasoning"],
+        )
+
 
 class OpenAICompatibleProvider:
     """LLMProvider implementation backed by any OpenAI-compatible endpoint.
@@ -129,6 +146,7 @@ class OpenAICompatibleProvider:
         slug, spec = self._resolve(model)
         gated = apply_feature_gates(spec, kwargs)
         body = to_openai_request(slug, gated)
+        _announce_reasoning(slug, body)
 
         try:
             resp = await self._client.post(
@@ -154,6 +172,7 @@ class OpenAICompatibleProvider:
         slug, spec = self._resolve(model)
         gated = apply_feature_gates(spec, kwargs)
         body = to_openai_request(slug, gated)
+        _announce_reasoning(slug, body)
         body["stream"] = True
         return _OpenAICompatibleStream(
             client=self._client,
