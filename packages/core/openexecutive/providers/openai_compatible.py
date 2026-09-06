@@ -30,7 +30,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from types import SimpleNamespace
 from typing import Any
@@ -63,6 +63,7 @@ class OpenAICompatibleProvider:
         timeout_s: float = 180.0,
         slug_lookup: dict[str, str] | None = None,
         spec_lookup: dict[str, FeatureSpec] | None = None,
+        model_resolver: Callable[[str], tuple[str, FeatureSpec] | None] | None = None,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
@@ -76,12 +77,21 @@ class OpenAICompatibleProvider:
         # through unchanged (the common case for local model names).
         self._slug_lookup = slug_lookup or {}
         self._spec_lookup = spec_lookup or {}
+        # Optional rule-based resolver consulted BEFORE the static lookups —
+        # lets the registry map whole model families (e.g. every Claude id)
+        # without enumerating them, so a catalog refresh after construction
+        # needs no provider rebuild. Returning None defers to the lookups.
+        self._model_resolver = model_resolver
 
     # ------------------------------------------------------------------
     # internal helpers
     # ------------------------------------------------------------------
 
     def _resolve(self, anthropic_model: str) -> tuple[str, FeatureSpec]:
+        if self._model_resolver is not None:
+            resolved = self._model_resolver(anthropic_model)
+            if resolved is not None:
+                return resolved
         slug = self._slug_lookup.get(anthropic_model, anthropic_model)
         spec = self._spec_lookup.get(
             anthropic_model,
