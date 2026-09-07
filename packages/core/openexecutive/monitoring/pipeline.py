@@ -28,6 +28,7 @@ Design notes:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -52,7 +53,7 @@ from openexecutive.monitoring.models import (
     Signal,
     WatchlistItem,
 )
-from openexecutive.monitoring.sources import get_source_for_kind
+from openexecutive.monitoring.sources import Source, get_source_for_kind
 from openexecutive.monitoring.sources._http import strip_url_query
 from openexecutive.monitoring.sources.base import (
     collapse_whitespace,
@@ -451,8 +452,20 @@ class _LostRace:
     """
 
     cutoff: str
+    # Entries our own adapter carved out of the baseline (see
+    # ``_split_baseline_exempt``). The winner didn't baseline these either
+    # — it promotes them after its transaction — so treating one as
+    # "already recorded" here is exactly how a live outage goes missing:
+    # we unblock the moment the winner commits, while it still has up to
+    # 200 audit inserts to get through, so the loser reaches the open
+    # incident FIRST and would burn its dedup key as baseline. Never
+    # covered, whatever its date; the UNIQUE(dedup_key) constraint keeps
+    # the two scans from both promoting it.
+    exempt: frozenset[str] = frozenset()
 
     def covers(self, signal: Signal) -> bool:
+        if signal.dedup_key in self.exempt:
+            return False
         published = _published(signal)
         if published is None:
             # Undated, or a bad date. Fail closed — it must not become an
@@ -468,7 +481,11 @@ class _LostRace:
 
 
 def _lost_race(
-    item: WatchlistItem, fetched_at: datetime, *, db_path: Path | None = None,
+    item: WatchlistItem,
+    fetched_at: datetime,
+    exempt: frozenset[str] = frozenset(),
+    *,
+    db_path: Path | None = None,
 ) -> _LostRace:
     """Build the lost-race policy from the winner's stamp."""
     assert item.id is not None
@@ -485,7 +502,50 @@ def _lost_race(
             "visible — treating this tick's entries as baseline", item.slug,
         )
         cutoff = (fetched_at + _RACE_CLOCK_TOLERANCE).isoformat()
-    return _LostRace(cutoff)
+    return _LostRace(cutoff, exempt)
+
+
+def _split_baseline_exempt(
+    src: Source,
+    item: WatchlistItem,
+    entries: list[Signal],
+    matches: Callable[[Signal], bool],
+) -> tuple[list[Signal], list[Signal]]:
+    """Split a seeding row's first-poll entries into (archive, exempt).
+
+    ``exempt`` is what the adapter's optional ``promote_on_baseline`` hook
+    claims is live news rather than back-catalogue (see
+    ``sources.base.Source``); ``archive`` is everything else and is
+    baselined exactly as before. An adapter without the hook exempts
+    nothing, which is the historical behaviour for ``rss`` / ``edgar``.
+
+    An entry that misses the row's trigger filter stays in ``archive``
+    however live it is. The baseline's guarantee is that EVERYTHING in the
+    feed is recorded, trigger misses included, so that widening a trigger
+    later cannot resurface what was already there — and an exempt entry
+    that missed the trigger would be dropped unrecorded by the cascade,
+    punching a hole in exactly that guarantee.
+
+    A hook that raises is treated as "not exempt" — the same fail-quiet
+    stance ``matches_trigger`` takes, and the safe one: a crashing hook
+    must not turn a first poll into a back-catalogue replay.
+    """
+    hook = getattr(src, "promote_on_baseline", None)
+    if hook is None:
+        return entries, []
+    archive: list[Signal] = []
+    exempt: list[Signal] = []
+    for signal in entries:
+        try:
+            is_exempt = bool(hook(signal, item)) and matches(signal)
+        except Exception:
+            logger.exception(
+                "monitoring.pipeline: promote_on_baseline crashed on %r — "
+                "treating as baseline", item.slug,
+            )
+            is_exempt = False
+        (exempt if is_exempt else archive).append(signal)
+    return archive, exempt
 
 
 def _record_baseline(
@@ -496,8 +556,10 @@ def _record_baseline(
     db_path: Path | None = None,
 ) -> int | None:
     """Try to baseline a seeding row: claim the stamp and record every
-    fetched entry — trigger misses included — as ``suppressed_baseline``
-    in ONE transaction.
+    entry it is handed — the row's back-catalogue, trigger misses
+    included, adapter-exempted entries excluded (see
+    ``_split_baseline_exempt``) — as ``suppressed_baseline`` in ONE
+    transaction.
 
     Returns how many rows were recorded, or ``None`` when another scan won
     the claim first (nothing written). The claim is a compare-and-swap on
@@ -654,18 +716,13 @@ async def _poll_one_watchlist_item(
     # baseline. ``item`` is the pre-poll snapshot, so the in-memory value
     # is unaffected by ``mark_polled``. Baseline rows never reach the
     # alert pipeline, so they are never charged to the scan budget.
-    lost_race: _LostRace | None = None
-    if (
-        getattr(src, "seed_on_first_poll", False)
-        and item.id is not None
-        and item.baselined_at is None
-    ):
-        recorded = _record_baseline(item, capped, fetched_at, db_path=db_path)
-        if recorded is not None:
-            tally.written = recorded
-            return
-        lost_race = _lost_race(item, fetched_at, db_path=db_path)
-
+    #
+    # An adapter may exempt individual entries from its own baseline via
+    # the optional ``promote_on_baseline`` hook (see ``sources.base``):
+    # ``vendor_status`` uses it so an incident that is still OPEN when the
+    # watch is added surfaces on that first poll while the resolved
+    # archive is still swallowed. Exempt entries skip the baseline write
+    # and fall through to the ordinary cascade below.
     # Apply the per-item trigger filter (default: True). Entries that miss
     # it are dropped — unless this scan lost the baseline race, in which
     # case a miss the winner didn't hold is still recorded as baseline so a
@@ -680,6 +737,45 @@ async def _poll_one_watchlist_item(
                 "treating as no-match", item.slug
             )
             return False
+
+    lost_race: _LostRace | None = None
+    # Entries the adapter carved out of its own baseline. They bypass the
+    # age gate below: the adapter has declared them still happening, and
+    # judging them by an <updated> stamp that can be days old (a
+    # long-running incident updates rarely) would record one as stale,
+    # burning its dedup key and muting it until the vendor next touches it
+    # — the regression the exemption exists to prevent.
+    exempt_keys: set[str] = set()
+    if (
+        getattr(src, "seed_on_first_poll", False)
+        and item.id is not None
+        and item.baselined_at is None
+    ):
+        archive, exempt = _split_baseline_exempt(src, item, capped, _matches)
+        exempt_keys = {signal.dedup_key for signal in exempt}
+        recorded = _record_baseline(item, archive, fetched_at, db_path=db_path)
+        if recorded is not None:
+            tally.written += recorded
+            if not exempt:
+                return
+            # The stamp is claimed and the archive is recorded, so this row
+            # is no longer seeding: the exempt entries run the ordinary
+            # cascade. Dying here leaves them unrecorded, and the next tick
+            # (no longer a first poll) promotes them normally instead of
+            # replaying the archive. The one gap is a concurrent scan: if
+            # it lost the CAS while we were fetching, our stamp covers the
+            # exempt entries it also holds, so it may record one as
+            # baseline before we promote it — muted until its next
+            # <updated>, which for a live incident is minutes away.
+            capped = exempt
+        else:
+            # Lost the claim: keep the whole feed (the winner's stamp
+            # decides what counts as baseline) but carry the exempt keys
+            # into that policy, so an open incident is judged as news here
+            # too rather than swallowed by the winner's cutoff.
+            lost_race = _lost_race(
+                item, fetched_at, frozenset(exempt_keys), db_path=db_path,
+            )
 
     # On a race tick the deferral bound is the tight drift tolerance, not
     # the lenient configured skew: nothing we fetched can honestly be dated
@@ -738,7 +834,7 @@ async def _poll_one_watchlist_item(
             )
             continue
 
-        if _is_stale(signal, now, max_age_days):
+        if signal.dedup_key not in exempt_keys and _is_stale(signal, now, max_age_days):
             _suppress(signal_id, item, signal, OUTCOME_SUPPRESSED_STALE, db_path=db_path)
             continue
 

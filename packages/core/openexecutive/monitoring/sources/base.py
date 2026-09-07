@@ -27,6 +27,7 @@ import logging
 import math
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -75,6 +76,24 @@ class Source(Protocol):
         (vendor status incident posted = always alert) don't need one.
         """
         ...
+
+    # OPTIONAL hook, deliberately NOT a Protocol member: adding a required
+    # one here would break structural conformance for the five adapters
+    # that don't need it. The pipeline looks it up with ``getattr`` and
+    # treats "absent" as "everything is baseline".
+    #
+    #     def promote_on_baseline(self, signal: Signal, item: WatchlistItem) -> bool
+    #
+    # Answers "on the FIRST poll of this row, is this entry live news rather
+    # than back-catalogue?". Only ``seed_on_first_poll`` adapters are asked.
+    # Entries it returns True for skip the baseline and run the normal
+    # cascade; everything else is recorded as ``suppressed_baseline`` exactly
+    # as before. ``vendor_status`` implements it (an incident still OPEN when
+    # the watch is added is news; the resolved archive is not) — see
+    # ``sources/vendor_status.py``. An adapter that defines it MUST also key
+    # its ``dedup_key`` on the entry's mutable state, not just its id:
+    # a baselined entry's key is burned, so a fixed-id key would mute the
+    # entry for good.
 
 
 # Re-export Signal so adapter code can ``from .base import Signal``.
@@ -142,6 +161,48 @@ def feed_entry_published_at(
             return dt.isoformat()
         fallback = fallback or dt.isoformat()
     return fallback
+
+
+def feed_text_published_at(raw: str | None) -> str | None:
+    """ISO 8601 UTC publish timestamp from a RAW feed date string, or None.
+
+    The sibling of ``feed_entry_published_at`` for adapters that parse XML
+    themselves instead of going through feedparser (``vendor_status``), so
+    they get the same ``Signal.published_at`` contract: an ISO 8601 string
+    in UTC, or None when the feed gives us nothing parseable.
+
+    Accepts both dialects the status-page feeds use — Atom ``<updated>``
+    (RFC 3339, ``2026-09-07T15:04:05Z``) and RSS ``<pubDate>``
+    (RFC 822, ``Sun, 07 Sep 2026 15:04:05 +0000``) — and normalises a
+    naive value to UTC, which is what every other date path here assumes.
+
+    Unlike ``feed_entry_published_at`` this takes no ``skew``: that
+    parameter only picks BETWEEN an entry's two date keys, and there is
+    one key here. An implausibly future value is returned as-is so the
+    pipeline can defer the entry (``pipeline._is_future``) rather than
+    record it — recording burns the dedup key.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    dt: datetime | None = None
+    try:
+        # 3.11's fromisoformat takes the trailing "Z"; it is stricter than
+        # RFC 3339 about fractional-second digits, hence the fallback.
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            dt = parsedate_to_datetime(text)
+        except (TypeError, ValueError):
+            return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    try:
+        return dt.astimezone(UTC).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _valid_skew_hours(raw: Any) -> float | None:
