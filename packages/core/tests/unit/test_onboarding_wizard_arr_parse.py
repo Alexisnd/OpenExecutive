@@ -91,3 +91,18 @@ def test_no_magnitude_leaves_the_field_unset() -> None:
 
     assert "annual_revenue_arr" not in profile
     assert profile["target_customer"]["pain_points"] == []
+
+
+def test_long_digit_run_is_linear_time() -> None:
+    """A "1,1,1,…" run with no magnitude after it must not go quadratic.
+
+    Every digit in the run used to be a candidate match start, so a 32k-char
+    answer took ~10s and a 320k one ~20 minutes on the event loop. With the
+    lookbehind only the run's first digit is a candidate. If this regresses
+    the test does not fail, it hangs — which is the point.
+    """
+    text = "1," * 100_000
+    profile = build_profile_from_answers({"business_model": text, "financials": text})
+
+    assert "annual_revenue_arr" not in profile
+    assert "burn_rate_monthly" not in profile["financials"]

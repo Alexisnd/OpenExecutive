@@ -13,6 +13,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from openexecutive.api.models import ONBOARD_ANSWER_MAX_CHARS
 from openexecutive.api.routes import onboarding as route
 from openexecutive.onboarding import profile_builder
 from openexecutive.onboarding.wizard import TOTAL_STEPS
@@ -54,7 +55,7 @@ def test_builder_failure_on_final_answer_is_retryable(
 
     resp = client.post("/onboard/answer", json={"session_id": session_id, "answer": "final"})
     assert resp.status_code == 422
-    assert "rephrase" in resp.json()["detail"]
+    assert "rephrase" in resp.json()["detail"].lower()
 
     # The session was rolled back to the last step, not stuck at completed.
     status = client.get(f"/onboard/status/{session_id}").json()
@@ -99,3 +100,26 @@ def test_issue_84_answer_completes_through_the_real_builder(
 
     assert resp.json()["completed"] is True
     assert (tmp_path / "profile.yaml").exists()
+
+
+def test_oversized_answer_is_rejected_before_parsing(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called = False
+
+    def _never(state):  # type: ignore[no-untyped-def]
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(profile_builder, "build_and_save_profile", _never)
+    session_id = client.get("/onboard/start").json()["session_id"]
+
+    too_long = "x" * (ONBOARD_ANSWER_MAX_CHARS + 1)
+    resp = client.post("/onboard/answer", json={"session_id": session_id, "answer": too_long})
+    assert resp.status_code == 422
+    assert route._wizard_sessions[session_id].current_step == 0
+
+    just_fits = "x" * ONBOARD_ANSWER_MAX_CHARS
+    resp = client.post("/onboard/answer", json={"session_id": session_id, "answer": just_fits})
+    assert resp.status_code == 200
+    assert called is False

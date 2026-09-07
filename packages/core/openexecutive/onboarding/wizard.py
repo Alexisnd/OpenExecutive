@@ -205,17 +205,22 @@ def build_profile_from_answers(answers: dict[str, Any]) -> dict[str, Any]:
         # also stops "300 clients, marketing" from being read as $300M and
         # "$5 minimum" from becoming $5M. The alternation keeps "M", "MM"
         # and "million" all parsing, since a bare `[Mm]\b` silently dropped
-        # "roughly 50 million" and "$50MM".
-        arr_match = re.search(r"\$?(\d[\d,]*)\s*(?:[Mm]{1,2}|[Mm]illion)\b", text)
+        # "roughly 50 million" and "$50MM". The lookbehind keeps the scan
+        # linear: without it every digit inside a long "1,1,1,…" run is a
+        # candidate start and the search goes quadratic on hostile input.
+        arr_match = re.search(
+            r"\$?(?<![\d,])(\d[\d,]*)\s*(?:[Mm]{1,2}|[Mm]illion)\b", text
+        )
         if arr_match:
             val = arr_match.group(1).replace(",", "")
             # Defensive: this is a best-effort parse of free text, so a
             # surprising input must never take down onboarding. Skipping
             # the field costs one profile value; raising costs the run.
+            # The answer text itself stays out of the log line.
             try:
                 profile["annual_revenue_arr"] = float(val) * 1_000_000
             except ValueError:
-                logger.warning("onboarding: could not parse ARR from %r", text[:80])
+                logger.warning("onboarding: could not parse ARR from the business-model answer")
 
     if "competitive_landscape" in answers:
         text = answers["competitive_landscape"]
@@ -268,7 +273,7 @@ def build_profile_from_answers(answers: dict[str, Any]) -> dict[str, Any]:
         # bare comma, so "runway is fine, monthly costs are low" captured
         # "," and crashed on float("").
         burn_match = re.search(
-            r"\$?(\d[\d,]*)\s*[Kk]?\s*(?:monthly|/month|per month|burn)", text
+            r"\$?(?<![\d,])(\d[\d,]*)\s*[Kk]?\s*(?:monthly|/month|per month|burn)", text
         )
         runway_match = re.search(r"(\d+)\s*month", text)
 
@@ -279,7 +284,9 @@ def build_profile_from_answers(answers: dict[str, Any]) -> dict[str, Any]:
             try:
                 fin["burn_rate_monthly"] = float(val) * multiplier
             except ValueError:
-                logger.warning("onboarding: could not parse burn rate from %r", text[:80])
+                # Financials are promised "stored locally only" — keep the
+                # answer text out of the log stream.
+                logger.warning("onboarding: could not parse burn rate from the financials answer")
         if runway_match:
             fin["runway_months"] = float(runway_match.group(1))
         profile["financials"] = fin

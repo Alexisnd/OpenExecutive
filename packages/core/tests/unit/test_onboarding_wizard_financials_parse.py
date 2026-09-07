@@ -17,7 +17,6 @@ from openexecutive.onboarding.wizard import build_profile_from_answers
     [
         "Runway is fine, monthly costs are low",
         "We are profitable, burn is zero",
-        "12 months runway, monthly burn 100k",
     ],
 )
 def test_comma_before_burn_keyword_does_not_crash(text: str) -> None:
@@ -27,6 +26,11 @@ def test_comma_before_burn_keyword_does_not_crash(text: str) -> None:
 
 
 def test_comma_case_still_records_runway() -> None:
+    """Used to crash on the bare comma before "monthly".
+
+    The burn figure here follows its keyword, which the magnitude-first
+    heuristic does not read; this test only pins the crash and the runway.
+    """
     profile = build_profile_from_answers(
         {"financials": "12 months runway, monthly burn 100k"}
     )

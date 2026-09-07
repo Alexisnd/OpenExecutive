@@ -76,13 +76,20 @@ async def submit_answer(body: OnboardAnswerRequest) -> OnboardStatusResponse:
         try:
             build_and_save_profile(state)
         except Exception as exc:
-            logger.exception("onboarding: profile build failed on the final answer")
+            # Type name only: a pydantic ValidationError's str() embeds the
+            # offending input, and the wizard answers include financials
+            # the UI promises are "stored locally only".
+            logger.error(
+                "onboarding: profile build failed on the final answer (%s)",
+                type(exc).__name__,
+            )
             _wizard_sessions[body.session_id] = snapshot
             raise HTTPException(
                 status_code=422,
                 detail=(
                     "Could not build the company profile from your answers. "
-                    "Please rephrase your last answer and try again."
+                    "Rephrase your last answer and try again, or restart "
+                    "onboarding if an earlier answer is the problem."
                 ),
             ) from exc
 

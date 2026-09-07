@@ -63,9 +63,15 @@ class ChatResponse(BaseModel):
     session_id: str
 
 
+ONBOARD_ANSWER_MAX_CHARS = 10_000
+
+
 class OnboardAnswerRequest(BaseModel):
     session_id: str
-    answer: str
+    # Wizard answers are a sentence or two, or a short one-per-line list.
+    # The free-text parsers in onboarding/wizard.py run regexes over this,
+    # so bound it rather than let one request pin the event loop.
+    answer: str = Field(max_length=ONBOARD_ANSWER_MAX_CHARS)
 
 
 class OnboardStatusResponse(BaseModel):

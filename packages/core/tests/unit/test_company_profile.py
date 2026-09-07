@@ -107,3 +107,31 @@ def test_prompt_block_includes_financials():
     block = profile.to_prompt_block()
     assert "300,000" in block
     assert "8.0 months" in block
+
+
+def test_save_to_yaml_is_atomic(tmp_path: Path, monkeypatch):
+    """A failure mid-dump must leave the previous profile.yaml untouched.
+
+    The onboarding route rolls its session back on a build failure on the
+    assumption that the on-disk profile every other subsystem loads survived.
+    A plain open(path, "w") truncates before yaml.dump writes a byte.
+    """
+    import yaml
+
+    path = tmp_path / "profile.yaml"
+    CompanyProfile(name="Before").save_to_yaml(path)
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(yaml, "dump", boom)
+    try:
+        CompanyProfile(name="After").save_to_yaml(path)
+    except OSError:
+        pass
+    else:  # pragma: no cover - the monkeypatch must propagate
+        raise AssertionError("save_to_yaml swallowed the failure")
+    monkeypatch.undo()
+
+    assert CompanyProfile.load_from_yaml(path).name == "Before"
+    assert [p.name for p in tmp_path.iterdir()] == ["profile.yaml"], "temp file left behind"

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import os
 from pathlib import Path
 from typing import Any
 
@@ -78,8 +80,21 @@ class CompanyProfile(BaseModel):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {"company": self.model_dump()}
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, default_flow_style=False, sort_keys=True)
+        # Write-then-rename so a failure mid-dump (disk full, unrepresentable
+        # value) can never leave a truncated profile behind: every other
+        # subsystem loads this file, and callers such as the onboarding
+        # route roll back on failure assuming the old profile survived.
+        # Plain open() (not mkstemp) so the temp file gets the normal umask
+        # permissions the final file would have had.
+        tmp_path = path.with_name(f".tmp-{os.getpid()}-{path.name}")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                yaml.dump(data, f, default_flow_style=False, sort_keys=True)
+            os.replace(tmp_path, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            raise
 
     def to_prompt_block(self) -> str:
         if not self.name:
