@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import uuid
 
@@ -62,13 +63,28 @@ async def submit_answer(body: OnboardAnswerRequest) -> OnboardStatusResponse:
     if state.completed:
         raise HTTPException(status_code=400, detail="Onboarding already completed")
 
+    # process_answer mutates the stored state in place. Keep a snapshot so
+    # a failed profile build on the final answer can be rolled back —
+    # otherwise the session is stuck at completed=True and every retry
+    # hits the 400 above, forcing the user to restart onboarding.
+    snapshot = copy.deepcopy(state)
     state = process_answer(state, body.answer)
-    _wizard_sessions[body.session_id] = state
 
     if state.completed:
         from openexecutive.onboarding.profile_builder import build_and_save_profile
 
-        build_and_save_profile(state)
+        try:
+            build_and_save_profile(state)
+        except Exception as exc:
+            logger.exception("onboarding: profile build failed on the final answer")
+            _wizard_sessions[body.session_id] = snapshot
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Could not build the company profile from your answers. "
+                    "Please rephrase your last answer and try again."
+                ),
+            ) from exc
 
         # Fire the watchlist-research workflow once at onboarding
         # completion so the principal's first /today after install
@@ -86,6 +102,8 @@ async def submit_answer(body: OnboardAnswerRequest) -> OnboardStatusResponse:
             # Auto-cleanup so the set doesn't grow unboundedly across
             # the process lifetime.
             task.add_done_callback(_background_research_tasks.discard)
+
+    _wizard_sessions[body.session_id] = state
 
     question = get_current_question(state) if not state.completed else None
     progress = state.get_progress()

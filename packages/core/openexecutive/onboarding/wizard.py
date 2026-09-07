@@ -198,13 +198,15 @@ def build_profile_from_answers(answers: dict[str, Any]) -> dict[str, Any]:
         profile["target_customer"] = {"profile": text, "pain_points": []}
         import re
 
-        # The capture must START with a digit and the M must end a word.
-        # `[\d,]+` alone matched a bare comma, so any answer with a comma
-        # before an m-word — "Consultoría estratégica, marketing y
-        # operaciones" — captured "," and crashed the whole wizard on
-        # float(""). Requiring \b also stops "300 clientes, marketing"
-        # from being read as $300M.
-        arr_match = re.search(r"\$?(\d[\d,]*)\s*[Mm]\b", text)
+        # The capture must START with a digit and the magnitude must end a
+        # word. `[\d,]+` alone matched a bare comma, so any answer with a
+        # comma before an m-word — "IT, marketing and video agency" —
+        # captured "," and crashed the whole wizard on float(""). The \b
+        # also stops "300 clients, marketing" from being read as $300M and
+        # "$5 minimum" from becoming $5M. The alternation keeps "M", "MM"
+        # and "million" all parsing, since a bare `[Mm]\b` silently dropped
+        # "roughly 50 million" and "$50MM".
+        arr_match = re.search(r"\$?(\d[\d,]*)\s*(?:[Mm]{1,2}|[Mm]illion)\b", text)
         if arr_match:
             val = arr_match.group(1).replace(",", "")
             # Defensive: this is a best-effort parse of free text, so a
@@ -262,14 +264,22 @@ def build_profile_from_answers(answers: dict[str, Any]) -> dict[str, Any]:
         import re
 
         text = answers["financials"]
-        burn_match = re.search(r"\$?([\d,]+)\s*[Kk]?\s*(?:monthly|/month|per month|burn)", text)
+        # Same digit-first rule as the ARR parse above: `[\d,]+` matched a
+        # bare comma, so "runway is fine, monthly costs are low" captured
+        # "," and crashed on float("").
+        burn_match = re.search(
+            r"\$?(\d[\d,]*)\s*[Kk]?\s*(?:monthly|/month|per month|burn)", text
+        )
         runway_match = re.search(r"(\d+)\s*month", text)
 
         fin: dict[str, Any] = {}
         if burn_match:
             val = burn_match.group(1).replace(",", "")
             multiplier = 1000 if "k" in text[burn_match.start():burn_match.end()].lower() else 1
-            fin["burn_rate_monthly"] = float(val) * multiplier
+            try:
+                fin["burn_rate_monthly"] = float(val) * multiplier
+            except ValueError:
+                logger.warning("onboarding: could not parse burn rate from %r", text[:80])
         if runway_match:
             fin["runway_months"] = float(runway_match.group(1))
         profile["financials"] = fin

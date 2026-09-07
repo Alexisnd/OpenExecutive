@@ -26,6 +26,8 @@ from openexecutive.onboarding.wizard import build_profile_from_answers
         "Vendemos software B2B, modelo de suscripción",
         "We sell software, mostly to mid-market teams",
         "Design and build, maintenance included",
+        # The exact answer from issue #84.
+        "IT, marketing and video agency",
     ],
 )
 def test_comma_before_m_word_does_not_crash(text: str) -> None:
@@ -42,6 +44,11 @@ def test_comma_before_m_word_does_not_crash(text: str) -> None:
         ("We do $2M in ARR", 2_000_000.0),
         ("Roughly 12M annually", 12_000_000.0),
         ("ARR is $1,500M across all lines", 1_500_000_000.0),
+        # Phrasings the bare `[Mm]\b` narrowing silently dropped.
+        ("roughly 50 million in revenue", 50_000_000.0),
+        ("About 3 Million ARR", 3_000_000.0),
+        ("$50MM ARR last year", 50_000_000.0),
+        ("we closed the year at 7mm", 7_000_000.0),
     ],
 )
 def test_magnitude_still_parses(text: str, expected: float) -> None:
@@ -60,6 +67,21 @@ def test_digits_before_an_m_word_are_not_a_magnitude() -> None:
     profile = build_profile_from_answers(
         {"business_model": "We have 300 clients, marketing is word of mouth"}
     )
+
+    assert "annual_revenue_arr" not in profile
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "$5 minimum order, mostly SMBs",
+        "We have 300 clients, marketing is word of mouth",
+        "12 major accounts and growing",
+    ],
+)
+def test_digits_before_a_non_magnitude_m_word_are_ignored(text: str) -> None:
+    """The word boundary must hold across the whole alternation."""
+    profile = build_profile_from_answers({"business_model": text})
 
     assert "annual_revenue_arr" not in profile
 
