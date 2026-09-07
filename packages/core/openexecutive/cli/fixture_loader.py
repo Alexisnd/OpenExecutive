@@ -65,6 +65,34 @@ _FIXTURE_OP_LOCK = asyncio.Lock()
 # sentinel file so a tampered/garbage value cannot reach the UI.
 _SAFE_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
+# Per-company DERIVED caches in the episodic DB. Regenerable, so always safe to
+# drop — and they MUST be dropped by every path that swaps the live company,
+# because /today serves them from cache and only regenerates in a
+# BackgroundTask. Leave a row behind and the next request renders the OUTGOING
+# company's text under the incoming one: observed live, one client's briefing
+# narrative appearing verbatim under another.
+#
+# Three separate paths swap live company state, and each maintained its own
+# hand-written table list — so this was fixed in one and still live in the other
+# two. They now all consume this constant: `clients.slots._BLANK_WIPE_TABLES`
+# (client switch into a blank/seed slot), `reset_all_state` (factory reset), and
+# `_apply_state_from_source` (fixture load AND unload). Any new per-company
+# cache table goes here, once.
+#
+# The fixture-path wipe belongs in `_apply_state_from_source`, NOT in
+# `_seed_episodic_memory`: that seeder returns early when the fixture has no
+# readable `memory.json`, and `load_fixture` only requires `profile.yaml` — so
+# such a fixture swaps the company while skipping a wipe placed inside the
+# seeder.
+#
+# Not included, deliberately: `generated_fixtures` (operator-level, see
+# `slots._GLOBAL_TABLES`) and `architecture_sections` (repo-derived, keyed by a
+# hash of the facts file — not company data).
+PER_CLIENT_CACHE_TABLES: tuple[str, ...] = (
+    "briefing_narrative",
+    "person_insights",
+)
+
 # Walk up from this file to find the repo root (contains evals/, fixtures/, etc.)
 # Match on ``fixtures/companies`` specifically — NOT a bare ``fixtures`` dir —
 # so the in-package ``openexecutive/fixtures/`` module (generated-fixture store
@@ -475,6 +503,13 @@ async def _apply_state_from_source(source_dir: Path, settings: Any) -> dict[str,
         EPISODIC_DB_PATH, ("external_signals", "watchlist")
     )
 
+    # ── 5b. Wipe the derived per-company caches ────────────────────────────
+    # Same leak class as the watchlist above; see PER_CLIENT_CACHE_TABLES for
+    # why this belongs here rather than in _seed_episodic_memory. Nothing in
+    # this step may become conditional on the fixture's contents.
+    caches_cleared = _wipe_derived_caches(EPISODIC_DB_PATH)
+    logger.info("fixture: cleared derived per-company caches: %s", caches_cleared)
+
     # ── 6. Reset the periodic research skip-if-unchanged gate ───────────────
     # The skip gate reads the last run's state_hash from audit_log; load/unload
     # wipes the profile/initiatives/watchlist that feed that fingerprint but
@@ -671,6 +706,10 @@ async def reset_all_state(
         # circuit (and there's nothing to wipe in a DB that isn't there).
         if EPISODIC_DB_PATH.exists():
             monitoring_store.initialize_db(EPISODIC_DB_PATH)
+        # Same reasoning for the derived caches in PER_CLIENT_CACHE_TABLES,
+        # which this DELETE pass also covers; the helper is guarded on the
+        # DB existing, exactly like the monitoring init above.
+        _initialize_derived_cache_schemas(EPISODIC_DB_PATH)
         episodic_cleared = _delete_all_rows(
             EPISODIC_DB_PATH,
             (
@@ -689,6 +728,7 @@ async def reset_all_state(
                 "eval_runs",
                 "external_signals",
                 "watchlist",
+                *PER_CLIENT_CACHE_TABLES,
             ),
         )
 
@@ -851,6 +891,37 @@ def _delete_all_rows(
     finally:
         conn.close()
     return counts
+
+
+def _initialize_derived_cache_schemas(db_path: Path) -> None:
+    """Create the PER_CLIENT_CACHE_TABLES schemas if the DB already exists.
+
+    Both caches CREATE TABLE lazily on first put, so a DB that has never
+    served a briefing lacks them — and ``_delete_all_rows`` guards only the DB
+    *file*, not each table, so a wipe would raise mid-pass. Idempotent
+    (CREATE TABLE IF NOT EXISTS). Guarded on the DB already existing so we
+    never materialise one the caller never created, which would defeat
+    ``_delete_all_rows``' own exists() short circuit.
+    """
+    if not db_path.exists():
+        return
+    from openexecutive.briefing import narrative_cache
+    from openexecutive.people import insights_cache
+
+    narrative_cache.initialize_db(db_path)
+    insights_cache.initialize_db(db_path)
+
+
+def _wipe_derived_caches(db_path: Path) -> dict[str, int]:
+    """Drop every row of the derived per-company caches; return per-table counts.
+
+    The one place the initialize-then-delete pairing is expressed for callers
+    that wipe only these tables. ``reset_all_state`` folds them into its own
+    single DELETE pass instead (it reports per-table counts for the whole
+    episodic DB), but shares ``_initialize_derived_cache_schemas`` above.
+    """
+    _initialize_derived_cache_schemas(db_path)
+    return _delete_all_rows(db_path, PER_CLIENT_CACHE_TABLES)
 
 
 def get_fixture_status(settings: Any) -> dict[str, Any]:
