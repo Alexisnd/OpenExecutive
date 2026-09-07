@@ -156,81 +156,101 @@ _RESOLVED_BODY_TEXT = (
         ("<p><strong>Postmortem</strong> - write-up.</p>", "x", "postmortem"),
         # Case and whitespace are the vendor's business, not ours.
         ("<p><STRONG> resolved </STRONG> - done.</p>", "x", "resolved"),
-        # The NEWEST label decides, and only it. Falling through to an
-        # older one would report a resolved incident as investigating,
-        # since the older labels on an incident are nearly always open.
-        ("<p><strong>Fixed</strong> - all good.</p>"
-         "<p><strong>Investigating</strong> - looking into it.</p>", "x", ""),
-        # …including when the first label is wrapped, attributed, or too
-        # long to be a label — each of which a pattern match would skip,
-        # landing on the older one.
-        ("<p><strong><em>Resolved</em></strong> - fixed.</p>"
-         "<p><strong>Investigating</strong> - looking.</p>", "x", "resolved"),
-        ('<p><strong class="hl">Resolved</strong> - fixed.</p>'
-         "<p><strong>Investigating</strong> - looking.</p>", "x", "resolved"),
-        ("<p><strong>" + "x" * 300 + "</strong></p>"
-         "<p><strong>Investigating</strong> - looking.</p>", "x", ""),
-        ("<p><strong>Investigating - never closed", "x", ""),
-        # Status is NEVER inferred from prose. "Update:" in an ordinary
-        # sentence used to classify a long-resolved incident as open —
-        # and open entries skip both the baseline and the age gate, so a
-        # 400-day-old resolved incident promoted itself at HIGH.
+        # Closure counts from prose as well as from a label — an update
+        # that says it is resolved closes the incident even though no
+        # label says so.
         ("This incident has been fully resolved. Update: no further action.",
-         "x", ""),
+         "x", "resolved"),
+        ("<p>Resolved - this incident has been resolved.</p>"
+         "<p><strong>Investigating</strong> - looking.</p>", "x", "resolved"),
+        # …but an OPEN reading needs a marked-up label. Prose alone never
+        # opens an incident: "Update:" in a sentence is not a status.
         ("We were monitoring - then it recovered.", "x", ""),
-        ("Sep 7, 19:07 UTCInvestigating - looking into it.", "x", ""),
-        # No markup anywhere: the title marker is the last resort, and
-        # body prose can no longer override it.
+        ("Sep 7, 19:07 UTC Investigating - looking into it.", "x", ""),
+        # No markup anywhere: the title marker decides, and it can only
+        # ever close.
         ("plain text body", "[RESOLVED] Increased error rates", "resolved"),
         ("9:16 AM PDT We are investigating: increased error rates.",
          "Service is operating normally: [RESOLVED] Increased error rates",
          "resolved"),
-        # A <strong> that isn't a status label must not be mistaken for one.
+        # A <strong> that isn't a status label is not a status.
         ("<p><strong>Note</strong> - unrelated bold text.</p>", "x", ""),
         ("", "", ""),
     ],
 )
-def test_latest_status_reads_the_newest_update(
+def test_status_reads_closure_from_anywhere_and_openness_only_from_a_label(
     body: str, title: str, expected: str,
 ) -> None:
     assert _latest_status(body, title) == expected
 
 
-def test_a_label_past_the_scan_head_fails_closed() -> None:
-    """A body whose first <strong> sits past the scanned head must score
-    unknown, not fall back to something the prose happens to contain."""
-    body = "Update: we are on it. " + ("filler " * 1_200) + "<strong>Resolved</strong>"
+@pytest.mark.parametrize(
+    "body",
+    [
+        # An unrecognised or empty label on the newest update, with an
+        # older open label and NO evidence of closure anywhere. This reads
+        # as open, and that is the rule's known residual: it is why the
+        # exemption does not also buy an entry past the age gate, so the
+        # blast radius is an entry the feed dates inside the age window
+        # rather than a years-old archive.
+        "<p><strong>Fixed</strong> - all good.</p>"
+        "<p><strong>Investigating</strong> - looking into it.</p>",
+        "<p><strong></strong> - x.</p>"
+        "<p><strong>Investigating</strong> - looking.</p>",
+    ],
+)
+def test_known_residual_an_unreadable_newest_label_reads_as_open(body: str) -> None:
+    assert _latest_status(body, "") == "investigating"
+
+
+def test_a_label_past_the_scan_head_is_not_read() -> None:
+    """The body is capped, so a label buried past the head cannot decide
+    anything — in either direction."""
+    body = "Update: we are on it. " + ("filler " * 1_200) + "<strong>Investigating</strong>"
     assert _latest_status(body, "") == ""
 
 
 @pytest.mark.parametrize(
     ("body", "expected"),
     [
-        # A real parser, so none of these read a LATER (older, and so
-        # nearly always open) label by mistake. Each line was a way a
-        # resolved incident reported itself live.
+        # Position is not a property tag soup can express, so the rule no
+        # longer depends on it. Each of these was a shape that made a
+        # position-based rule read an OLDER, open label and report a
+        # resolved incident as live — implicit <p> close, one block with
+        # <br> separators, no wrapper, a block tag outside any list we
+        # could keep, and a close tag swallowed by a script or a comment.
+        ("<p>Resolved - this incident has been resolved."
+         "<p><strong>Investigating</strong> - looking.</p>", "resolved"),
+        ("<div>Sep 7 12:00 UTC - Resolved - all clear.<br/><br/>"
+         "Sep 7 09:00 UTC - <strong>Investigating</strong> - looking.</div>",
+         "resolved"),
+        ("Sep 7 12:00 UTC Resolved - all clear.<br/>"
+         "Sep 7 09:00 UTC <strong>Investigating</strong> - looking.", "resolved"),
+        ("<h3>Sep 7 - Resolved - all clear.</h3>"
+         "<h3><strong>Investigating</strong></h3>", "resolved"),
+        ("<header>Resolved - all clear.</header>"
+         "<p><strong>Investigating</strong></p>", "resolved"),
+        ('<p>Resolved - all clear.<script>var s = "</p>";</script>'
+         "<p><strong>Investigating</strong></p>", "resolved"),
+        ("<p>Resolved - all clear.<!-- </p> -->"
+         "<p><strong>Investigating</strong></p>", "resolved"),
+        ("<p><em>Resolved</em> - fixed.<p><strong>Investigating</strong></p>",
+         "resolved"),
+        # A real parser, so a label in a comment or an attribute value is
+        # not a label, <b> counts as much as <strong>, nested emphasis is
+        # kept, and a spaced close tag closes.
         ("<p><b>Resolved</b> - fixed.</p>"
          "<p><strong>Investigating</strong> - looking.</p>", "resolved"),
-        ("<!-- <strong>Investigating</strong> -->"
-         "<p><strong>Resolved</strong> - fixed.</p>", "resolved"),
         ('<p><a href="/x?q=<strong>Investigating</strong>">Resolved</a>'
-         " - fixed.</p>", ""),
-        ("<p><strong><em>Resolved</em></strong> - fixed.</p>"
-         "<p><strong>Investigating</strong> - looking.</p>", "resolved"),
-        ('<p><strong class="hl">Resolved</strong> - fixed.</p>'
-         "<p><strong>Investigating</strong> - looking.</p>", "resolved"),
-        # The newest update carries no label, or an empty one: stop at the
-        # end of its block rather than reading the previous update's.
-        ("<p>Resolved - this incident has been resolved.</p>"
-         "<p><strong>Investigating</strong> - looking.</p>", ""),
-        ("<p><strong></strong> - x.</p>"
-         "<p><strong>Investigating</strong> - looking.</p>", ""),
-        # A close tag with a space is valid HTML and must not mute a live
-        # outage.
+         " - fixed.</p>", "resolved"),
         ("<p><strong>Investigating</strong > - live.</p>", "investigating"),
+        ("<p><strong><em>Monitoring</em></strong> - a fix is applied.</p>",
+         "monitoring"),
     ],
 )
-def test_only_the_newest_label_decides(body: str, expected: str) -> None:
+def test_closure_is_read_however_the_body_is_shaped(
+    body: str, expected: str,
+) -> None:
     assert _latest_status(body, "") == expected
 
 
@@ -257,10 +277,10 @@ def test_xhtml_body_reads_only_its_newest_update() -> None:
     labelled = _parse_feed(_feed("<strong>Resolved</strong> - fixed."))[0]
     assert _latest_status(labelled["body"], labelled["title"]) == "resolved"
 
-    # Newest update unlabelled: must NOT fall through to the older
-    # "Investigating", which would promote a resolved incident at HIGH.
+    # Newest update unlabelled: its prose still closes the incident, so it
+    # cannot fall through to the older "Investigating" and promote at HIGH.
     unlabelled = _parse_feed(_feed("Resolved - this incident has been resolved."))[0]
-    assert _latest_status(unlabelled["body"], unlabelled["title"]) == ""
+    assert _latest_status(unlabelled["body"], unlabelled["title"]) == "resolved"
 
 
 def test_label_never_comes_from_a_different_element_than_the_body() -> None:
@@ -283,7 +303,7 @@ def test_label_never_comes_from_a_different_element_than_the_body() -> None:
   </entry>
 </feed>"""
     entry = _parse_feed(feed)[0]
-    assert _latest_status(entry["body"], entry["title"]) == ""
+    assert _latest_status(entry["body"], entry["title"]) == "resolved"
 
 
 def test_is_open_fails_closed_on_unknown_status() -> None:
