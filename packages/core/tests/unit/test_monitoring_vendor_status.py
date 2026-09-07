@@ -155,19 +155,35 @@ _RESOLVED_BODY_TEXT = (
         ("<p><strong>Postmortem</strong> - write-up.</p>", "x", "postmortem"),
         # Case and whitespace are the vendor's business, not ours.
         ("<p><STRONG> resolved </STRONG> - done.</p>", "x", "resolved"),
-        # An unrecognised NEWEST label must NOT fall through to an older
-        # one: the older labels on an incident are nearly always open, so
-        # scanning on would report a resolved incident as investigating.
+        # The NEWEST label decides, and only it. Falling through to an
+        # older one would report a resolved incident as investigating,
+        # since the older labels on an incident are nearly always open.
         ("<p><strong>Fixed</strong> - all good.</p>"
          "<p><strong>Investigating</strong> - looking into it.</p>", "x", ""),
-        # No markup at all: a known label in the body text still counts
-        # (xhtml <content>, or a vendor publishing plain-text updates).
-        # NOT anchored — itertext() glues the timestamp onto the label,
-        # which is what every real Statuspage body looks like here.
-        ("Sep 7, 19:07 UTCInvestigating - looking into it.", "x", "investigating"),
-        ("Completed: the maintenance window is over.", "x", "completed"),
-        # No per-update markup: fall back to the title marker (AWS).
+        # …including when the first label is wrapped, attributed, or too
+        # long to be a label — each of which a pattern match would skip,
+        # landing on the older one.
+        ("<p><strong><em>Resolved</em></strong> - fixed.</p>"
+         "<p><strong>Investigating</strong> - looking.</p>", "x", "resolved"),
+        ('<p><strong class="hl">Resolved</strong> - fixed.</p>'
+         "<p><strong>Investigating</strong> - looking.</p>", "x", "resolved"),
+        ("<p><strong>" + "x" * 300 + "</strong></p>"
+         "<p><strong>Investigating</strong> - looking.</p>", "x", ""),
+        ("<p><strong>Investigating - never closed", "x", ""),
+        # Status is NEVER inferred from prose. "Update:" in an ordinary
+        # sentence used to classify a long-resolved incident as open —
+        # and open entries skip both the baseline and the age gate, so a
+        # 400-day-old resolved incident promoted itself at HIGH.
+        ("This incident has been fully resolved. Update: no further action.",
+         "x", ""),
+        ("We were monitoring - then it recovered.", "x", ""),
+        ("Sep 7, 19:07 UTCInvestigating - looking into it.", "x", ""),
+        # No markup anywhere: the title marker is the last resort, and
+        # body prose can no longer override it.
         ("plain text body", "[RESOLVED] Increased error rates", "resolved"),
+        ("9:16 AM PDT We are investigating: increased error rates.",
+         "Service is operating normally: [RESOLVED] Increased error rates",
+         "resolved"),
         # A <strong> that isn't a status label must not be mistaken for one.
         ("<p><strong>Note</strong> - unrelated bold text.</p>", "x", ""),
         ("", "", ""),
@@ -177,6 +193,23 @@ def test_latest_status_reads_the_newest_update(
     body: str, title: str, expected: str,
 ) -> None:
     assert _latest_status(body, title) == expected
+
+
+def test_a_label_past_the_scan_head_fails_closed() -> None:
+    """A body whose first <strong> sits past the scanned head must score
+    unknown, not fall back to something the prose happens to contain."""
+    body = "Update: we are on it. " + ("filler " * 1_200) + "<strong>Resolved</strong>"
+    assert _latest_status(body, "") == ""
+
+
+def test_structural_label_is_used_when_markup_never_reaches_the_text() -> None:
+    """An xhtml <content> is parsed into elements, so the tags are gone by
+    the time the body is text — the label comes from the element tree."""
+    assert _latest_status("Sep 7, 19:07 UTCInvestigating - looking.", "x",
+                          "Investigating") == "investigating"
+    # …and it is still only consulted when the text carries no markup.
+    assert _latest_status("<p><strong>Resolved</strong> - done.</p>", "x",
+                          "Investigating") == "resolved"
 
 
 def test_is_open_fails_closed_on_unknown_status() -> None:

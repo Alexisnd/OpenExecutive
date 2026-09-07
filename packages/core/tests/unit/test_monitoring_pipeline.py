@@ -694,6 +694,58 @@ def test_baseline_exempt_trigger_miss_is_still_recorded(
     assert promoted == []
 
 
+_AWS_SHAPED_RSS = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Vendor Status</title>
+    <item>
+      <guid>https://status.example.com/#svc_1757251800</guid>
+      <title>Service is operating normally: [RESOLVED] Increased error rates</title>
+      <link>https://status.example.com/</link>
+      <pubDate>{pub}</pubDate>
+      <description>{body}</description>
+    </item>
+  </channel>
+</rss>
+"""
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Prose that names a status. Mining this was how a resolved
+        # archive entry classified itself OPEN — and an open entry skips
+        # the baseline AND the age gate, so it promoted at HIGH.
+        "Update: Between 10:19 and 11:30 the issue was resolved.",
+        "We were monitoring - then it recovered.",
+        "Between 9:00 and 11:30 PDT we experienced elevated errors.",
+    ],
+)
+def test_old_resolved_entry_is_never_promoted_on_a_first_poll(
+    db: Path,
+    install_source_feed,
+    monkeypatch: pytest.MonkeyPatch,
+    body: str,
+) -> None:
+    """Issue #90's acceptance criterion, end to end on the real adapter: a
+    watch added today must not alert on a vendor's resolved archive — not
+    for an entry whose title says [RESOLVED] and whose body merely talks
+    about statuses, and not at 400 days old."""
+    promoted = _install_promotion_recorder(monkeypatch)
+    _insert_feed(db, "vendor-aws", target="https://status.example.com/rss/all.rss")
+    install_source_feed("vendor_status", _AWS_SHAPED_RSS.format(
+        pub=(datetime.now(UTC) - timedelta(days=400)).strftime(
+            "%a, %d %b %Y %H:%M:%S +0000"),
+        body=body,
+    ))
+
+    asyncio.run(mp.run_external_monitor_scan(db_path=db))
+
+    outcomes = {r["dedup_key"]: r["processed_outcome"] for r in ms.list_recent_signals(db_path=db)}
+    assert list(outcomes.values()) == [OUTCOME_SUPPRESSED_BASELINE]
+    assert promoted == []
+
+
 def test_every_entry_exempt_still_stamps_the_baseline(
     db: Path,
     install_fake_source,
@@ -977,9 +1029,12 @@ def test_status_scan_is_linear_on_a_hostile_body() -> None:
     hostile = "<strong>" + " " * 7_991 + "."
     started = time.perf_counter()
     assert _latest_status(hostile, "") == ""
-    # The fixed pattern scans this in ~0ms and the vulnerable one took
-    # >3s, so the bound is three orders of magnitude clear of both.
-    assert time.perf_counter() - started < 2.0
+    elapsed = time.perf_counter() - started
+    # The label text is now bounded by str.find rather than a regex, so
+    # this runs in microseconds; the vulnerable pattern took ~3s. A 0.5s
+    # budget is ~1000x the real cost and still catches a regression on a
+    # runner several times faster than this one — 2.0s would not have.
+    assert elapsed < 0.5, f"status scan took {elapsed:.2f}s — check for backtracking"
 
 
 def test_scan_that_loses_baseline_race_does_not_replay_back_catalogue(

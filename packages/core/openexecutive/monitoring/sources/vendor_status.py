@@ -34,9 +34,10 @@ incident, both #80 freshness gates become safe here:
   - the row is seeded on its first poll (``seed_on_first_poll``), with
     the incidents that are still OPEN exempted from the baseline by
     ``promote_on_baseline`` so a live outage surfaces immediately while
-    the resolved archive is recorded and never promoted (openness is read
-    from the entry body, so it is only detectable on feeds that publish
-    per-update status labels — see ``promote_on_baseline``);
+    the resolved archive is recorded and never promoted. Openness is read
+    from the label the vendor marked up on its newest update, never
+    inferred from prose, so it is only detectable on feeds that publish
+    per-update status labels — see ``promote_on_baseline``;
   - ``published_at`` is parsed from ``<updated>`` / ``<pubDate>``, so the
     age gate and the future-date deferral judge vendor incidents the same
     way they judge ``rss`` and ``edgar`` entries.
@@ -105,34 +106,28 @@ _OPEN_STATUSES = frozenset({
 })
 _CLOSED_STATUSES = frozenset({"resolved", "completed", "postmortem"})
 
-# Newest-update label in a Statuspage entry body. NO \s* padding around
-# the capture: \s is a subset of [^<>], so the two overlap and the engine
-# backtracks quadratically over a run of whitespace — a feed of entries
-# whose body is "<strong>" plus 8k spaces (well inside the 2MB fetch cap)
-# cost 3.4s PER ENTRY, synchronously, on the event loop the API serves
-# from. Whitespace is folded by _known_status anyway, so dropping the
-# padding is free: the same body now scans in ~0ms. Keep any future edit
-# to this pattern free of overlapping quantifiers.
-_STRONG_LABEL_RE = re.compile(r"<strong>([^<>]{1,40})</strong>", re.IGNORECASE)
-# Same label, in a body that carries no markup for us to key on — an
-# xhtml-typed Atom <content> (real child elements, so the tags are consumed
-# by the parser and never reach us as text) or a plain-text update. NOT
-# anchored: itertext() glues the update's timestamp onto the label
-# ("Sep 7, 19:07 UTCInvestigating - looking into it."), so an anchored
-# pattern would never fire on a real body. Safety comes from the
-# vocabulary, not the position — only a label we already know can match,
-# and only when followed by Statuspage's " - " / ": " separator.
-_TEXT_LABEL_RE = re.compile(
-    r"(" + "|".join(re.escape(s) for s in sorted(_OPEN_STATUSES | _CLOSED_STATUSES))
-    + r")\s*[-–—:]\s",
-    re.IGNORECASE,
-)
+# Opening tag of the newest update's label. Attributes allowed (some
+# Statuspage themes emit <strong class="…">); the label TEXT is then taken
+# by plain string search, not by regex, so no pattern ever runs over
+# body-length input. That is deliberate: the previous pattern padded the
+# capture with \s*, which overlaps [^<>] and backtracked quadratically —
+# a feed of entries whose body was "<strong>" plus 8k spaces (well inside
+# the 2MB fetch cap) cost 3.4s PER ENTRY, synchronously, on the event loop
+# the API serves from. Keep this path free of unbounded regex.
+_STRONG_OPEN_RE = re.compile(r"<strong\b[^>]*>", re.IGNORECASE)
+_STRONG_CLOSE = "</strong>"
+# Inline tags INSIDE a label (<strong><em>Resolved</em></strong>) — stripped
+# before the vocabulary check so the emphasis doesn't hide the word.
+_TAG_RE = re.compile(r"<[^>]*>")
 # AWS's rss/all.rss carries no per-update markup; it stamps the resolution
 # into the title instead ("Service is operating normally: [RESOLVED] …").
 _TITLE_MARKER_RE = re.compile(r"\[\s*(resolved|completed)\s*\]", re.IGNORECASE)
 # The newest update sits at the top of the body; a few KB is far more than
-# enough to find it and bounds the regex work regardless of body size.
+# enough to find it and bounds the work regardless of body size.
 _BODY_SCAN_CHARS = 8_000
+# A status label is a word or two. Anything longer between the tags is not
+# a label, and reading on would only find an OLDER update's.
+_MAX_LABEL_CHARS = 200
 
 
 class VendorStatusSource:
@@ -233,7 +228,9 @@ class VendorStatusSource:
                 "title": title,
                 "link": entry.get("link", ""),
                 "updated": updated,
-                "status": _latest_status(entry.get("body", ""), title),
+                "status": _latest_status(
+                    entry.get("body", ""), title, entry.get("label", ""),
+                ),
             },
             provenance_url=entry.get("link") or item.target,
             severity_hint=AlertSeverity.HIGH,
@@ -309,9 +306,11 @@ def _parse_atom(feed: Element) -> list[dict[str, str]]:
         if link_el is not None:
             link = (link_el.get("href") or "").strip()
         link = strip_url_query(link) if link else ""
+        body_tags = (f"{_ATOM_NS}content", f"{_ATOM_NS}summary")
         out.append({
             "id": entry_id, "title": title, "link": link, "updated": updated,
-            "body": _element_text(entry, (f"{_ATOM_NS}content", f"{_ATOM_NS}summary")),
+            "body": _element_text(entry, body_tags),
+            "label": _element_label(entry, body_tags),
         })
     return out
 
@@ -327,11 +326,37 @@ def _parse_rss(channel: Element) -> list[dict[str, str]]:
         # Prefer guid for id (stable upstream identifier); fall back to
         # the cleaned link so dedup remains stable.
         entry_id = guid or link
+        body_tags = ("description", _CONTENT_ENCODED)
         out.append({
             "id": entry_id, "title": title, "link": link, "updated": pub,
-            "body": _element_text(item, ("description", _CONTENT_ENCODED)),
+            "body": _element_text(item, body_tags),
+            "label": _element_label(item, body_tags),
         })
     return out
+
+
+def _element_label(parent: Element, tags: tuple[str, ...]) -> str:
+    """Text of the first ``<strong>`` / ``<b>`` descendant of the body.
+
+    For an xhtml-typed Atom ``<content>`` the markup is real elements, so
+    the parser consumes the tags and ``_element_text`` returns only their
+    text — with the update's timestamp glued to the label ("Sep 7, 19:07
+    UTCInvestigating - …"). Reading the element tree recovers the label
+    exactly, with no guessing about where it starts.
+    """
+    for tag in tags:
+        el = parent.find(tag)
+        if el is None:
+            continue
+        for node in el.iter():
+            # Namespace-agnostic: xhtml children arrive as
+            # "{http://www.w3.org/1999/xhtml}strong".
+            local = node.tag.rsplit("}", 1)[-1].lower() if isinstance(node.tag, str) else ""
+            if local in {"strong", "b"}:
+                text = "".join(node.itertext()).strip()
+                if text:
+                    return text[:_MAX_LABEL_CHARS]
+    return ""
 
 
 def _element_text(parent: Element, tags: tuple[str, ...]) -> str:
@@ -351,41 +376,59 @@ def _element_text(parent: Element, tags: tuple[str, ...]) -> str:
     return ""
 
 
-def _latest_status(body: str, title: str) -> str:
+def _latest_status(body: str, title: str, label: str = "") -> str:
     """The incident's CURRENT status, lowercased, or "" when unknown.
 
     Statuspage puts the newest update first in the entry body and labels
-    it ``<strong>Resolved</strong>`` / ``Investigating`` / …, so the first
-    recognised label in the body head is the incident's state right now.
-    Two fallbacks for feeds shaped differently: a label leading the body
-    text (an xhtml-typed ``<content>`` reaches us as text with its tags
-    already consumed by the parser, and some vendors publish plain-text
-    updates), then a title marker (AWS stamps ``[RESOLVED]`` there and
-    publishes no per-update markup at all).
+    it ``<strong>Resolved</strong>`` / ``Investigating`` / …, so the state
+    right now is whatever the FIRST such label says — and only that one.
+    An unrecognised first label means we do not understand this feed:
+    return "" and let the caller fail closed. Reading on to a later label
+    would report an OLDER state, and the older labels on an incident are
+    nearly always open ones, so a resolved incident would come back
+    "investigating" and promote itself out of the first-poll baseline.
 
-    Returns "" for anything unrecognised rather than guessing — callers
-    decide what to do with an unknown status, and ``_is_open`` fails
-    closed.
+    ``label`` is the same thing extracted structurally by the parser for a
+    body whose markup never reaches us as text (an xhtml-typed Atom
+    ``<content>`` holds real child elements) — see ``_element_label``.
+    Last resort is a title marker, which only ever says CLOSED.
+
+    Deliberately NOT inferred from prose. An earlier cut searched the body
+    text for any known status word followed by a separator; "Update:" in
+    an ordinary sentence then classified a long-resolved incident as open,
+    which — since open entries skip both the baseline and the age gate —
+    promoted a 400-day-old resolved incident at HIGH on a new watch, i.e.
+    issue #90 reintroduced. A status only ever comes from a label the
+    vendor marked up as one.
     """
-    head = body[:_BODY_SCAN_CHARS]
-    newest = _STRONG_LABEL_RE.search(head)
-    if newest is not None:
-        # This vendor uses Statuspage's per-update markup, so the FIRST
-        # bold label is the newest update's — the incident's state right
-        # now — and it is the only one worth reading. An unrecognised
-        # label means we do not understand this feed: return "" and let
-        # the caller fail closed. Scanning past it to a later <strong>
-        # would report an OLDER state, and the older labels on an incident
-        # are nearly always open ones, so a resolved incident would come
-        # back "investigating" and promote itself out of the baseline.
-        return _known_status(newest.group(1))
-    # No per-update markup anywhere in the head: fall back to a known
-    # label in the body text, then to a title marker.
-    leading = _TEXT_LABEL_RE.search(head)
-    if leading is not None:
-        return _known_status(leading.group(1))
+    inline = _newest_label(body[:_BODY_SCAN_CHARS])
+    if inline is not None:
+        return _known_status(inline)
+    if label:
+        return _known_status(label)
     marker = _TITLE_MARKER_RE.search(title)
     return marker.group(1).lower() if marker else ""
+
+
+def _newest_label(head: str) -> str | None:
+    """Text of the FIRST ``<strong>`` element in ``head``.
+
+    None when the body carries no such markup at all (the caller then
+    tries its other sources); "" when markup IS present but unusable —
+    unclosed, or too long to be a label — which fails closed rather than
+    letting the caller look past it at an older update.
+
+    The label text is bounded by ``str.find`` rather than a regex, so no
+    pattern ever runs over attacker-controlled body-length input.
+    """
+    opening = _STRONG_OPEN_RE.search(head)
+    if opening is None:
+        return None
+    rest = head[opening.end():opening.end() + _MAX_LABEL_CHARS]
+    close = rest.lower().find(_STRONG_CLOSE)
+    if close == -1:
+        return ""
+    return _TAG_RE.sub("", rest[:close])
 
 
 def _known_status(raw: str) -> str:
