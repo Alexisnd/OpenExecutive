@@ -316,12 +316,22 @@ the app refuses to start.
 | `HONCHO_ENABLED` | No | `false` | Per-person memory layer ([honcho.dev](https://honcho.dev)) — a peer card shared across all channels |
 | `HONCHO_API_KEY` | No | — | Required when `HONCHO_ENABLED=true` |
 | `HONCHO_BASE_URL` | No | — | Self-hosted Honcho endpoint |
+| `ENABLE_WEB_SEARCH` | No | `true`² | Let the Executive and specialists answer with live web results (news, market data, competitor moves) alongside your uploaded documents |
+| `WEB_SEARCH_MAX_USES` | No | `2` | Max billed searches per agent per turn |
 
 See [.env.example](.env.example) for the full list.
 
 > ¹ `ANTHROPIC_API_KEY` is required only when you serve Claude models directly.
 > It can be omitted entirely if you run on local models (`LOCAL_MODELS_ENABLED`)
 > or route through OpenRouter (`OPENROUTER_ENABLED`).
+
+> ² The application default is on, but **[.env.example](.env.example) ships
+> `ENABLE_WEB_SEARCH=false`** so a fresh setup incurs no per-search charges —
+> if the agents tell you they can't search the web or read the news, flip it
+> to `true` in your `.env` and restart. Uses Anthropic's server-side
+> `web_search` tool, so it applies to Claude models (local models can't use
+> it). `WEB_SEARCH_ALLOWED_DOMAINS` / `WEB_SEARCH_BLOCKED_DOMAINS` scope where
+> it may look (set at most one).
 
 ## Running on Local Models
 
