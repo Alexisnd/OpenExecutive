@@ -272,8 +272,11 @@ def build_profile_from_answers(answers: dict[str, Any]) -> dict[str, Any]:
         # Same digit-first rule as the ARR parse above: `[\d,]+` matched a
         # bare comma, so "runway is fine, monthly costs are low" captured
         # "," and crashed on float("").
+        # `(?:[Kk]\s*)?` rather than `[Kk]?\s*` after the first `\s*`: two
+        # adjacent `\s*` with an optional token between them let a long
+        # whitespace run be split quadratically many ways.
         burn_match = re.search(
-            r"\$?(?<![\d,])(\d[\d,]*)\s*[Kk]?\s*(?:monthly|/month|per month|burn)", text
+            r"\$?(?<![\d,])(\d[\d,]*)\s*(?:[Kk]\s*)?(?:monthly|/month|per month|burn)", text
         )
         runway_match = re.search(r"(\d+)\s*month", text)
 

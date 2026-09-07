@@ -135,3 +135,21 @@ def test_save_to_yaml_is_atomic(tmp_path: Path, monkeypatch):
 
     assert CompanyProfile.load_from_yaml(path).name == "Before"
     assert [p.name for p in tmp_path.iterdir()] == ["profile.yaml"], "temp file left behind"
+
+
+def test_save_to_yaml_preserves_mode_and_sweeps_stale_temps(tmp_path: Path):
+    """Rename creates a new inode; an operator's chmod must survive it."""
+    import os
+    import stat
+
+    path = tmp_path / "profile.yaml"
+    CompanyProfile(name="Before").save_to_yaml(path)
+    os.chmod(path, 0o600)
+    stale = tmp_path / ".tmp-1-deadbeef-profile.yaml"
+    stale.write_text("leftover from a crash", encoding="utf-8")
+
+    CompanyProfile(name="After").save_to_yaml(path)
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert CompanyProfile.load_from_yaml(path).name == "After"
+    assert [p.name for p in tmp_path.iterdir()] == ["profile.yaml"]

@@ -63,15 +63,20 @@ class ChatResponse(BaseModel):
     session_id: str
 
 
+# Wizard answers are a sentence or two, or a short one-per-line list. The
+# free-text parsers in onboarding/wizard.py run regexes over this, so it is
+# a safety bound on event-loop time, not only a UX choice — do not raise it
+# without re-checking the parser benchmarks in test_onboarding_wizard_arr_parse.
 ONBOARD_ANSWER_MAX_CHARS = 10_000
 
 
 class OnboardAnswerRequest(BaseModel):
     session_id: str
-    # Wizard answers are a sentence or two, or a short one-per-line list.
-    # The free-text parsers in onboarding/wizard.py run regexes over this,
-    # so bound it rather than let one request pin the event loop.
-    answer: str = Field(max_length=ONBOARD_ANSWER_MAX_CHARS)
+    # Bounded to ONBOARD_ANSWER_MAX_CHARS in the route rather than with
+    # Field(max_length=...): FastAPI's default validation error echoes the
+    # rejected input back in the response body, and wizard answers include
+    # financials the UI promises are stored locally only.
+    answer: str
 
 
 class OnboardStatusResponse(BaseModel):

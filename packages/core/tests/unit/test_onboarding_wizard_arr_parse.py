@@ -106,3 +106,17 @@ def test_long_digit_run_is_linear_time() -> None:
 
     assert "annual_revenue_arr" not in profile
     assert "burn_rate_monthly" not in profile["financials"]
+
+
+def test_long_whitespace_run_is_linear_time() -> None:
+    """A digit followed by a long space run must not go quadratic either.
+
+    The burn-rate pattern once had `\\s*[Kk]?\\s*`; with the K absent the two
+    `\\s*` could split the run every possible way (400ms at 10k chars, 6s at
+    40k). Sized past the API's answer bound so it does not depend on it.
+    """
+    text = "1" + " " * 200_000
+    profile = build_profile_from_answers({"business_model": text, "financials": text})
+
+    assert "annual_revenue_arr" not in profile
+    assert "burn_rate_monthly" not in profile["financials"]

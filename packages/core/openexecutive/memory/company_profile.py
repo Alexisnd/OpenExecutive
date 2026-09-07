@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextlib
 import os
+import secrets
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -84,13 +86,44 @@ class CompanyProfile(BaseModel):
         # value) can never leave a truncated profile behind: every other
         # subsystem loads this file, and callers such as the onboarding
         # route roll back on failure assuming the old profile survived.
-        # Plain open() (not mkstemp) so the temp file gets the normal umask
-        # permissions the final file would have had.
-        tmp_path = path.with_name(f".tmp-{os.getpid()}-{path.name}")
+        #
+        # - O_EXCL via `opener`: the temp name is created fresh and never
+        #   follows a pre-planted symlink. Going through open() (not
+        #   os.fdopen) keeps the explicit-encoding contract visible.
+        # - A random component plus O_EXCL: two processes on one volume
+        #   (both PID 1 in their containers) cannot collide.
+        # - The destination's mode is carried over: rename creates a new
+        #   inode, so a file an operator chmod'd 0600 would otherwise
+        #   silently revert to the umask default.
+        # - fsync file and directory: a hard crash between write and
+        #   rename must not leave a zero-length profile.
+        # Stale temps from an earlier crash are swept first so a
+        # 0644 copy of the financials never lingers in company/.
+        for stale in path.parent.glob(f".tmp-*-{path.name}"):
+            with contextlib.suppress(OSError):
+                stale.unlink()
+        tmp_path = path.with_name(f".tmp-{os.getpid()}-{secrets.token_hex(4)}-{path.name}")
+        existing_mode: int | None = None
+        with contextlib.suppress(OSError):
+            existing_mode = stat.S_IMODE(path.stat().st_mode)
+
+        def _exclusive(p: str, flags: int) -> int:
+            return os.open(p, flags | os.O_EXCL, 0o600 if existing_mode is None else existing_mode)
+
         try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8", opener=_exclusive) as f:
+                if existing_mode is not None:
+                    os.fchmod(f.fileno(), existing_mode)
                 yaml.dump(data, f, default_flow_style=False, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp_path, path)
+            with contextlib.suppress(OSError):
+                dir_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
         except BaseException:
             with contextlib.suppress(OSError):
                 os.unlink(tmp_path)

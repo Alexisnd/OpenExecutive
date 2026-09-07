@@ -7,7 +7,11 @@ import uuid
 
 from fastapi import APIRouter, HTTPException
 
-from openexecutive.api.models import OnboardAnswerRequest, OnboardStatusResponse
+from openexecutive.api.models import (
+    ONBOARD_ANSWER_MAX_CHARS,
+    OnboardAnswerRequest,
+    OnboardStatusResponse,
+)
 from openexecutive.onboarding.wizard import (
     TOTAL_STEPS,
     WizardState,
@@ -62,6 +66,11 @@ async def submit_answer(body: OnboardAnswerRequest) -> OnboardStatusResponse:
         raise HTTPException(status_code=404, detail="Onboarding session not found")
     if state.completed:
         raise HTTPException(status_code=400, detail="Onboarding already completed")
+    if len(body.answer) > ONBOARD_ANSWER_MAX_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Answer is too long (limit {ONBOARD_ANSWER_MAX_CHARS:,} characters).",
+        )
 
     # process_answer mutates the stored state in place. Keep a snapshot so
     # a failed profile build on the final answer can be rolled back —

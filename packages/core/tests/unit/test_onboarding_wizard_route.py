@@ -114,10 +114,14 @@ def test_oversized_answer_is_rejected_before_parsing(
     monkeypatch.setattr(profile_builder, "build_and_save_profile", _never)
     session_id = client.get("/onboard/start").json()["session_id"]
 
-    too_long = "x" * (ONBOARD_ANSWER_MAX_CHARS + 1)
+    too_long = "SECRET-BURN-" + "x" * ONBOARD_ANSWER_MAX_CHARS
     resp = client.post("/onboard/answer", json={"session_id": session_id, "answer": too_long})
     assert resp.status_code == 422
     assert route._wizard_sessions[session_id].current_step == 0
+    # The rejection must not echo the answer back (FastAPI's default
+    # validation error would include the full `input`).
+    assert "SECRET-BURN" not in resp.text
+    assert len(resp.content) < 500
 
     just_fits = "x" * ONBOARD_ANSWER_MAX_CHARS
     resp = client.post("/onboard/answer", json={"session_id": session_id, "answer": just_fits})
