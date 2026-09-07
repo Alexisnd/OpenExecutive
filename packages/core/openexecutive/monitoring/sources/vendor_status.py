@@ -44,10 +44,12 @@ incident, both #80 freshness gates become safe here:
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
 from datetime import UTC, datetime
+from html import escape
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse
@@ -91,7 +93,8 @@ _CONTENT_ENCODED = "{http://purl.org/rss/1.0/modules/content/}encoded"
 
 # The documented Statuspage history feed is bounded (~25 entries) — a
 # runaway count here means the feed is malformed and we should stop
-# reading rather than process megabytes of garbage.
+# reading rather than process megabytes of garbage. Applied in the
+# parsers, before each entry's body is serialised and parsed.
 _MAX_ENTRIES_PER_FEED = 100
 
 # Incident status vocabulary. Statuspage renders each update in the entry
@@ -117,12 +120,18 @@ _BODY_SCAN_CHARS = 8_000
 _MAX_LABEL_CHARS = 200
 # Tags a vendor marks an update's status label with.
 _LABEL_TAGS = frozenset({"strong", "b"})
-# Block-level tags. One update = one block, so the first block to CLOSE
-# ends the newest update: a label found after that belongs to an older one.
-_BLOCK_TAGS = frozenset({
-    "p", "div", "li", "ul", "ol", "tr", "td", "th", "table",
-    "section", "article", "blockquote", "dd", "dt", "dl",
-})
+# Evidence that the incident is over, taken from ANYWHERE in the body —
+# label or prose. See _latest_status for why this direction may read prose
+# and the OPEN direction may not.
+_CLOSED_WORD_RE = re.compile(
+    r"\b(" + "|".join(sorted(_CLOSED_STATUSES)) + r")\b", re.IGNORECASE
+)
+# Labels to read from one body. The body is already capped; this bounds
+# the list a pathological body can build.
+_MAX_LABELS = 50
+# Nesting depth _element_markup will serialise. Deeper than any real feed,
+# and shallow enough that the walk cannot exhaust the stack.
+_MAX_ELEMENT_DEPTH = 100
 
 
 class VendorStatusSource:
@@ -174,7 +183,12 @@ class VendorStatusSource:
             return []
 
         try:
-            entries = _parse_feed(body)
+            # Off the event loop: parsing is CPU-bound over bytes a
+            # watched URL controls, and the scan runs inside the API
+            # process. A body of 8k "<" costs ~5ms per entry to tokenize —
+            # half a second for a 100-entry feed — which is not a bug to
+            # fix in the parser but latency no HTTP handler should eat.
+            entries = await asyncio.to_thread(_parse_feed, body)
         except ParseError as exc:
             logger.warning(
                 "vendor_status: feed %s failed to parse: %s", item.target, exc
@@ -190,7 +204,7 @@ class VendorStatusSource:
         )
         built = (
             self._build_signal(entry, item, vendor_label)
-            for entry in entries[:_MAX_ENTRIES_PER_FEED]
+            for entry in entries
         )
         return [signal for signal in built if signal is not None]
 
@@ -290,7 +304,10 @@ def _parse_feed(body: bytes) -> list[dict[str, str]]:
 
 def _parse_atom(feed: Element) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
-    for entry in feed.findall(f"{_ATOM_NS}entry"):
+    # Capped HERE, not after parsing: each entry's body is re-serialised
+    # and parsed, so a 5000-entry feed would pay that cost 5000 times
+    # before the cap dropped all but the first 100.
+    for entry in feed.findall(f"{_ATOM_NS}entry")[:_MAX_ENTRIES_PER_FEED]:
         entry_id = (entry.findtext(f"{_ATOM_NS}id") or "").strip()
         title = (entry.findtext(f"{_ATOM_NS}title") or "").strip()
         updated = (entry.findtext(f"{_ATOM_NS}updated") or "").strip()
@@ -308,7 +325,7 @@ def _parse_atom(feed: Element) -> list[dict[str, str]]:
 
 def _parse_rss(channel: Element) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
-    for item in channel.findall("item"):
+    for item in channel.findall("item")[:_MAX_ENTRIES_PER_FEED]:
         guid = (item.findtext("guid") or "").strip()
         link = (item.findtext("link") or "").strip()
         title = (item.findtext("title") or "").strip()
@@ -344,146 +361,182 @@ def _entry_body(parent: Element, tags: tuple[str, ...]) -> str:
         el = parent.find(tag)
         if el is None:
             continue
-        markup = _element_markup(el) if len(el) else (el.text or "")
-        if markup.strip():
-            return markup
+        # Chosen on the element's TEXT: an empty <content><div/></content>
+        # serialises to "<div></div>", which is truthy markup carrying no
+        # content, and would shadow a <summary> holding the real log.
+        if not "".join(el.itertext()).strip():
+            continue
+        return _element_markup(el) if len(el) else (el.text or "")
     return ""
 
 
 def _element_markup(el: Element) -> str:
     """Re-serialise an element's children as simple HTML, local names only.
 
-    Bounded by ``_BODY_SCAN_CHARS``: the newest update is at the top, and
-    an unbounded walk would let a label buried hundreds of updates deep in
-    an archive decide that the incident is open.
+    Text is HTML-escaped on the way out. The XML parser has already turned
+    ``&lt;strong&gt;`` in an update's prose back into literal ``<strong>``,
+    and emitting that raw would hand the HTML parser a status label the
+    vendor never marked up — letting an entry that merely *mentions* a
+    label forge one.
+
+    Iterative with an explicit depth cap: a body nested a few thousand
+    elements deep would otherwise raise RecursionError out of the parse,
+    which the pipeline catches as an adapter crash — the row would then
+    fail every tick, never baseline, and emit nothing, silencing its own
+    watch. Bounded by ``_BODY_SCAN_CHARS`` as well: the newest update is at
+    the top, and serialising an entire archive is work no answer needs.
     """
     out: list[str] = []
     size = 0
+    # (element, depth) to open, or a literal string to emit as-is.
+    stack: list[tuple[Element, int] | str] = []
 
-    def emit(text: str) -> bool:
+    def push(text: str) -> None:
         nonlocal size
         out.append(text)
         size += len(text)
-        return size < _BODY_SCAN_CHARS
-
-    def walk(node: Element) -> bool:
-        for child in node:
-            local = (
-                child.tag.rsplit("}", 1)[-1].lower()
-                if isinstance(child.tag, str) else ""
-            )
-            if not emit(f"<{local}>"):
-                return False
-            if child.text and not emit(child.text):
-                return False
-            if not walk(child):
-                return False
-            if not emit(f"</{local}>"):
-                return False
-            if child.tail and not emit(child.tail):
-                return False
-        return True
 
     if el.text:
-        emit(el.text)
-    walk(el)
+        push(escape(el.text))
+    stack.extend(reversed([(child, 1) for child in el]))
+    while stack and size < _BODY_SCAN_CHARS:
+        item = stack.pop()
+        if isinstance(item, str):
+            push(item)
+            continue
+        node, depth = item
+        local = (
+            node.tag.rsplit("}", 1)[-1].lower() if isinstance(node.tag, str) else ""
+        )
+        push(f"<{local}>")
+        if node.text:
+            push(escape(node.text))
+        tail = escape(node.tail) if node.tail else ""
+        # Children first, then this element's close tag, then its tail.
+        pending: list[tuple[Element, int] | str] = [f"</{local}>"]
+        if tail:
+            pending.append(tail)
+        if depth < _MAX_ELEMENT_DEPTH:
+            children: list[tuple[Element, int] | str] = [
+                (child, depth + 1) for child in node
+            ]
+            pending = children + pending
+        stack.extend(reversed(pending))
     return "".join(out)
 
 
 def _latest_status(body: str, title: str) -> str:
-    """The incident's CURRENT status, lowercased, or "" when unknown.
+    """Whether this incident is still happening, lowercased, or "" .
 
-    Statuspage puts the newest update first and marks its status up as a
-    label (``<strong>Resolved</strong>``), so the state right now is what
-    that ONE label says. Everything here exists to avoid reading any other
-    one: an older label is nearly always an open status, so mistaking one
-    for the newest reports a long-resolved incident as live — and since an
-    open incident skips both the first-poll baseline and the age gate,
-    that promotes a years-old resolved incident at HIGH. Three review
-    rounds each found a different way to make that mistake.
+    Read the asymmetry here first, because it is the safety property:
 
-    So the body is parsed by a real HTML parser (``_FirstLabel``) rather
-    than scanned, and the answer is whatever the first label element
-    contains — even if that is nothing recognisable, in which case this
-    returns "" and ``_is_open`` fails closed. A body with no label at all
-    falls through to the title marker, which can only ever say CLOSED.
+      * evidence that the incident is OVER counts from anywhere — the
+        title's ``[RESOLVED]`` marker, a status label, or the prose of an
+        update;
+      * evidence that it is still OPEN counts only from a status label
+        the vendor marked up as one (``<strong>Investigating</strong>``).
 
-    Status is never inferred from prose: "Update:" in an ordinary
-    sentence is not a status label, and treating it as one is how a
-    400-day-old resolved incident promoted itself at HIGH.
+    Nothing here tries to work out which update is the newest, and that is
+    deliberate. Four review rounds each found a different way to get that
+    wrong — scanning past an unrecognised label, mining prose for status
+    words, skipping an unlabelled update in the element tree, and reading
+    past a block whose end tag HTML lets you omit — and every one of them
+    reported a long-resolved incident as live. An "open" verdict promotes
+    at HIGH and skips the first-poll baseline, so reading an older, open
+    label replays exactly the archive this adapter exists to stop
+    replaying. Position in the body is not a property tag soup can be
+    trusted to express, so the rule no longer depends on it: ANY sign of
+    closure closes, wherever it sits, and that is monotone — more evidence
+    can only ever make the answer safer.
+
+    The cost is that a live incident whose prose happens to say "resolved"
+    is read as closed, so a watch added mid-outage reports it on its next
+    update rather than immediately. That is the direction to be wrong in.
     """
-    label = _first_label(body[:_BODY_SCAN_CHARS])
-    if label is not None:
-        return _known_status(label)
     marker = _TITLE_MARKER_RE.search(title)
-    return marker.group(1).lower() if marker else ""
+    if marker is not None:
+        return marker.group(1).lower()
+    reader = _read_body(body[:_BODY_SCAN_CHARS])
+    statuses = [_known_status(raw) for raw in reader.labels]
+    # Labels first, exactly: a label whose own text is split across inline
+    # tags survives here even though the text probe below would see a
+    # space through the middle of the word.
+    for status in statuses:
+        if status in _CLOSED_STATUSES:
+            return status
+    closed = _CLOSED_WORD_RE.search(reader.text)
+    if closed is not None:
+        return closed.group(1).lower()
+    for status in statuses:
+        if status in _OPEN_STATUSES:
+            return status
+    return ""
 
 
-class _FirstLabel(HTMLParser):
-    """Extracts the text of the FIRST status label in an update body.
+class _BodyReader(HTMLParser):
+    """Splits an update log into its plain text and its status labels.
 
-    A real parser, so a ``<strong>`` inside a comment or an attribute
+    A real parser, so a label inside a comment, a script, or an attribute
     value is not a label, ``<b>`` counts as much as ``<strong>``, nested
-    emphasis inside a label is kept, and ``</strong >`` closes normally —
-    each of which a hand-rolled scan got wrong in a way that reported a
-    resolved incident as open.
-
-    ``label`` is None when the body holds no label at all (the caller
-    falls through), and a string — possibly empty — once one is found or
-    ruled out. It stops at the first block element to CLOSE: one update is
-    one block, so a label after that point belongs to an OLDER update and
-    must not be read. An unclosed label yields "" for the same reason.
+    emphasis inside a label is kept, and ``</strong >`` closes normally.
+    No notion of where one update ends and the next begins — see
+    ``_latest_status``.
     """
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self._parts: list[str] = []
+        self.text: str = ""
+        self.labels: list[str] = []
+        self._chunks: list[str] = []
+        self._label: list[str] | None = None
         self._tag: str | None = None
         self._depth = 0
-        self._done = False
-        self._found = False
-
-    @property
-    def label(self) -> str | None:
-        if not self._found:
-            return None
-        return "".join(self._parts).strip()[:_MAX_LABEL_CHARS] if self._done else ""
 
     def handle_starttag(self, tag: str, attrs: object) -> None:
-        if self._done:
-            return
-        if not self._found and tag in _LABEL_TAGS:
-            self._found, self._tag, self._depth = True, tag, 1
-        elif self._found and tag == self._tag:
+        if self._label is None:
+            if tag in _LABEL_TAGS and len(self.labels) < _MAX_LABELS:
+                self._label, self._tag, self._depth = [], tag, 1
+        elif tag == self._tag:
             self._depth += 1
 
     def handle_endtag(self, tag: str) -> None:
-        if self._done:
-            return
-        if self._found and tag == self._tag:
+        if self._label is not None and tag == self._tag:
             self._depth -= 1
             if self._depth == 0:
-                self._done = True
-        elif not self._found and tag in _BLOCK_TAGS:
-            # The newest update ended without a label. Stop rather than
-            # walk on into the previous update's.
-            self._found, self._done = True, True
+                self.labels.append("".join(self._label).strip())
+                self._label, self._tag = None, None
 
     def handle_data(self, data: str) -> None:
-        if self._found and not self._done:
-            self._parts.append(data)
+        self._chunks.append(data)
+        if self._label is not None:
+            self._label.append(data)
+
+    def handle_startendtag(self, tag: str, attrs: object) -> None:
+        # <strong/> and friends: a self-closing label opens and closes at
+        # once, so it must not swallow the rest of the body as its text.
+        return
+
+    def close(self) -> None:
+        super().close()
+        # Joined with a SPACE, not "": a tag boundary is a token boundary,
+        # and "".join glues the words either side of one
+        # ("<small>12:00 UTC</small><strong>Resolved</strong>" → "UTCResolved"),
+        # which hides the word from a \b-anchored search. Adding
+        # boundaries can only reveal evidence of closure, never conceal it.
+        self.text = " ".join(self._chunks)
 
 
-def _first_label(body: str) -> str | None:
-    """``_FirstLabel`` applied to one body; None when it holds no label."""
-    parser = _FirstLabel()
+def _read_body(body: str) -> _BodyReader:
+    """``_BodyReader`` over one body. Lenient: a parse that gives up keeps
+    whatever it read, which can only mean less evidence, never more."""
+    reader = _BodyReader()
     try:
-        parser.feed(body)
-        parser.close()
+        reader.feed(body)
+        reader.close()
     except Exception:  # pragma: no cover - HTMLParser is lenient by design
-        logger.debug("vendor_status: label parse failed", exc_info=True)
-        return parser.label
-    return parser.label
+        logger.debug("vendor_status: body parse failed", exc_info=True)
+        reader.text = "".join(reader._chunks)
+    return reader
 
 
 def _known_status(raw: str) -> str:

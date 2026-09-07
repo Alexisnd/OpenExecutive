@@ -633,32 +633,37 @@ def test_vendor_status_first_poll_alerts_the_outage_not_the_archive(
     assert len(promoted) == 2
 
 
-def test_baseline_exempt_entry_bypasses_the_age_gate(
+def test_baseline_exempt_entry_still_faces_the_age_gate(
     db: Path,
     install_fake_source,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An adapter that exempts an entry has declared it still happening, so
-    the age gate must not judge it by its <updated> stamp: a long-running
-    incident whose last update is 8 days old would be recorded as stale,
-    burning its dedup key and muting it until the vendor next touches it."""
+    """The exemption buys an entry past the BASELINE, never past its own
+    timestamp. An adapter's "this is live" is a reading of vendor-
+    controlled markup, and four review rounds each found a way to make
+    that reading say "open" about a years-old resolved incident — with the
+    age gate lifted, nothing stood between an archive and a HIGH alert."""
     promoted = _install_promotion_recorder(monkeypatch)
     _insert_feed(db, "vendor-stripe")
     install_fake_source(
         [
-            _make_signal(dedup_key="vendor_status:quiet", published_at=_iso_days_ago(8)),
+            _make_signal(dedup_key="vendor_status:live", published_at=_iso_days_ago(0.1)),
+            _make_signal(dedup_key="vendor_status:ancient", published_at=_iso_days_ago(400)),
             _make_signal(dedup_key="vendor_status:old", published_at=_iso_days_ago(90)),
         ],
         seed=True,
-        promote=lambda signal, item: signal.dedup_key.endswith(":quiet"),
+        # The adapter claims BOTH the fresh and the 400-day-old entry are
+        # open — the misclassification every review round produced.
+        promote=lambda signal, item: not signal.dedup_key.endswith(":old"),
     )
 
     asyncio.run(mp.run_external_monitor_scan(db_path=db))
 
     outcomes = {r["dedup_key"]: r["processed_outcome"] for r in ms.list_recent_signals(db_path=db)}
-    assert outcomes["vendor_status:quiet"] == OUTCOME_ALERTED
+    assert outcomes["vendor_status:live"] == OUTCOME_ALERTED
+    assert outcomes["vendor_status:ancient"] == OUTCOME_SUPPRESSED_STALE
     assert outcomes["vendor_status:old"] == OUTCOME_SUPPRESSED_BASELINE
-    assert [e.external_id for e in promoted] == ["vendor_status:quiet"]
+    assert [e.external_id for e in promoted] == ["vendor_status:live"]
 
 
 def test_baseline_exempt_trigger_miss_is_still_recorded(
@@ -999,7 +1004,7 @@ def test_loser_of_the_baseline_race_still_promotes_an_open_incident(
             _make_signal(
                 dedup_key="vendor_status:open",
                 published_at=(stamp - timedelta(minutes=30)).isoformat(),
-            ),
+            ),  # before the cutoff, but well inside the age window
             _make_signal(
                 dedup_key="vendor_status:archived",
                 published_at=(stamp - timedelta(days=200)).isoformat(),
@@ -1030,7 +1035,11 @@ def test_status_scan_is_linear_on_a_hostile_body() -> None:
     # 3.4s payload) and a body that is nothing but unterminated opening
     # tags, which a later `<strong\b[^>]*>` pattern scanned quadratically
     # at 3.7ms/entry — 370ms per 100-entry feed on the API's event loop.
-    for hostile in ("<strong>" + " " * 7_991 + ".", ("<strong " * 1_000)[:8_000]):
+    for hostile in (
+        "<strong>" + " " * 7_991 + ".",
+        ("<strong " * 1_000)[:8_000],
+        "<" * 8_000,  # the slowest shape measured: pure opening delimiters
+    ):
         started = time.perf_counter()
         assert _latest_status(hostile, "") == ""
         elapsed = time.perf_counter() - started

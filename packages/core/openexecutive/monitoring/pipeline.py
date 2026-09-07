@@ -739,12 +739,19 @@ async def _poll_one_watchlist_item(
             return False
 
     lost_race: _LostRace | None = None
-    # Entries the adapter carved out of its own baseline. They bypass the
-    # age gate below: the adapter has declared them still happening, and
-    # judging them by an <updated> stamp that can be days old (a
-    # long-running incident updates rarely) would record one as stale,
-    # burning its dedup key and muting it until the vendor next touches it
-    # — the regression the exemption exists to prevent.
+    # Entries the adapter carved out of its own baseline. They still face
+    # the age gate below. That gate was briefly lifted for them, on the
+    # reasoning that a long-running incident updates rarely and would be
+    # recorded as stale; four review rounds then showed what it was
+    # holding back. An adapter's "this is live" is a reading of markup the
+    # VENDOR controls, and every way that reading went wrong reported a
+    # years-old resolved incident as live — with the gate lifted, nothing
+    # stood between an archive and a HIGH alert. So the exemption buys an
+    # entry past the baseline, never past its own timestamp: whatever the
+    # adapter believes, an entry the feed dates outside the age window is
+    # not news. The cost is the case that lifted it — an open incident
+    # silent for longer than the window is reported on its next update
+    # rather than immediately — and that is the direction to be wrong in.
     exempt_keys: set[str] = set()
     if (
         getattr(src, "seed_on_first_poll", False)
@@ -834,7 +841,7 @@ async def _poll_one_watchlist_item(
             )
             continue
 
-        if signal.dedup_key not in exempt_keys and _is_stale(signal, now, max_age_days):
+        if _is_stale(signal, now, max_age_days):
             _suppress(signal_id, item, signal, OUTCOME_SUPPRESSED_STALE, db_path=db_path)
             continue
 
