@@ -23,7 +23,6 @@ import inspect
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -150,30 +149,50 @@ def test_apply_state_from_source_resets_research_skip_gate() -> None:
 # serves them from cache and only regenerates in a BackgroundTask, loading a
 # demo fixture over a live company rendered that company's real briefing
 # narrative verbatim under the demo — on the surface most likely to be
-# screen-shared. All three swapping paths now consume PER_CLIENT_CACHE_TABLES.
+# screen-shared. All three swapping paths now consume PER_CLIENT_CACHE_TABLES,
+# and on the fixture path the wipe sits in _apply_state_from_source rather
+# than in _seed_episodic_memory, which returns early without a memory.json.
 
 
-def test_seed_episodic_memory_clears_derived_caches(
-    _episodic_db: Path, tmp_path: Path
+def test_delete_clears_derived_caches_on_a_never_briefed_db(
+    _episodic_db: Path,
 ) -> None:
-    """The fixture-load seeder must drop the outgoing company's cached text.
+    """The cache wipe must work against the live schema, including a cold DB.
 
-    Behavioural, not a source grep: ``_seed_episodic_memory`` is cheap, and it
-    resolves the DB via ``episodic.DB_PATH`` imported at call time, which the
-    ``_episodic_db`` fixture monkeypatches — so the wipe is proven against the
-    live schema rather than asserted from source.
+    Behavioural, and deliberately routed through ``_delete_all_rows`` — the
+    same helper the call site delegates to — for the reason this module's
+    docstring gives: exercising ``_apply_state_from_source`` end to end would
+    drag ChromaDB, Honcho and an ``app.state`` shim into a unit test.
+
+    The cold-DB half is the regression the author hit: both caches CREATE
+    TABLE lazily on first put, so a DB that has never served a briefing lacks
+    them, and ``_delete_all_rows`` is not per-table existence-guarded. The
+    call site initializes both schemas first; this proves that is sufficient
+    and that the DELETE then really empties warm rows.
     """
-    import json
-
     from openexecutive.briefing import narrative_cache
-    from openexecutive.cli.fixture_loader import _seed_episodic_memory
+    from openexecutive.cli.fixture_loader import PER_CLIENT_CACHE_TABLES
     from openexecutive.people import insights_cache
 
-    # First arg is the fixture's memory.json, NOT a db path; an absent or
-    # unparseable file short-circuits before the wipe, so it must be real.
-    memory_path = tmp_path / "memory.json"
-    memory_path.write_text(json.dumps({"decisions": []}), encoding="utf-8")
+    # Cold: neither table exists yet on this DB.
+    with sqlite3.connect(str(_episodic_db)) as conn:
+        present = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?, ?)",
+                PER_CLIENT_CACHE_TABLES,
+            )
+        }
+    assert present == set(), (
+        "these caches are expected to be created lazily; if they now ship in "
+        "the base episodic schema the initialize_db calls at the wipe site "
+        "are redundant, but the wipe itself still must not regress."
+    )
+    narrative_cache.initialize_db(_episodic_db)
+    insights_cache.initialize_db(_episodic_db)
+    _delete_all_rows(_episodic_db, PER_CLIENT_CACHE_TABLES)  # must not raise
 
+    # Warm: rows written by the outgoing company are actually removed.
     narrative_cache.put(
         narrative_cache.BriefingNarrative(
             scope="principal",
@@ -195,36 +214,61 @@ def test_seed_episodic_memory_clears_derived_caches(
     assert narrative_cache.get("principal", db_path=_episodic_db) is not None
     assert insights_cache.get(1, db_path=_episodic_db) is not None
 
-    # settings has no episodic_db_path, so the seeder falls back to the
-    # monkeypatched episodic.DB_PATH — i.e. _episodic_db.
-    _seed_episodic_memory(memory_path, SimpleNamespace())
+    _delete_all_rows(_episodic_db, PER_CLIENT_CACHE_TABLES)
 
     assert narrative_cache.get("principal", db_path=_episodic_db) is None
     assert insights_cache.get(1, db_path=_episodic_db) is None
 
 
-def test_wipe_lists_consume_the_shared_cache_constant() -> None:
-    """All three swapping paths must reference the one constant, not copies.
+def test_fixture_path_wipes_caches_unconditionally() -> None:
+    """The fixture-path wipe must not sit behind ``memory.json``.
 
-    The original bug was three hand-maintained table lists over one DB: the fix
-    landed in one and the leak stayed live in the other two. Source-grep for the
-    heavy async ``reset_all_state`` (same cheap guard the monitoring tables use)
-    and for the shared constant in the slot wipe list.
+    ``_seed_episodic_memory`` returns early when the fixture has no
+    ``memory.json``, when that file will not parse, and when the DB is
+    missing. ``load_fixture`` only requires ``profile.yaml``, so a fixture
+    with no usable ``memory.json`` still swaps the company — and a wipe
+    placed inside the seeder is skipped on exactly those loads, leaving the
+    outgoing company's narrative to be served under the incoming one.
+
+    So the wipe belongs in ``_apply_state_from_source``, beside the
+    unconditional watchlist wipe, and must stay out of the seeder. This pins
+    both halves; the sibling test above proves the deletion itself works.
     """
     from openexecutive.cli.fixture_loader import (
         PER_CLIENT_CACHE_TABLES,
         _seed_episodic_memory,
     )
-    from openexecutive.clients.slots import _BLANK_WIPE_TABLES
 
     assert PER_CLIENT_CACHE_TABLES == ("briefing_narrative", "person_insights")
 
-    for fn in (reset_all_state, _seed_episodic_memory):
-        assert "PER_CLIENT_CACHE_TABLES" in inspect.getsource(fn), (
-            f"{fn.__name__} no longer consumes PER_CLIENT_CACHE_TABLES — the "
-            "outgoing company's cached briefing narrative will survive and be "
-            "rendered under the incoming one."
-        )
+    assert "PER_CLIENT_CACHE_TABLES" in inspect.getsource(_apply_state_from_source), (
+        "_apply_state_from_source no longer wipes the derived caches — fixture "
+        "load/unload will serve the outgoing company's briefing narrative "
+        "under the incoming one."
+    )
+    assert "PER_CLIENT_CACHE_TABLES" not in inspect.getsource(_seed_episodic_memory), (
+        "the derived-cache wipe moved back into _seed_episodic_memory, which "
+        "returns early on a fixture with no readable memory.json — those loads "
+        "would swap the company and skip the wipe."
+    )
+
+
+def test_reset_and_slot_switch_consume_the_shared_cache_constant() -> None:
+    """The other two company-swapping paths must reference the one constant.
+
+    The original bug was three hand-maintained table lists over one DB: the
+    fix landed in one and the leak stayed live in the other two. Source-grep
+    for the heavy async ``reset_all_state`` (the same cheap guard the
+    monitoring tables use above) and for the shared constant in the slot
+    wipe list.
+    """
+    from openexecutive.cli.fixture_loader import PER_CLIENT_CACHE_TABLES
+    from openexecutive.clients.slots import _BLANK_WIPE_TABLES
+
+    assert "PER_CLIENT_CACHE_TABLES" in inspect.getsource(reset_all_state), (
+        "reset_all_state no longer consumes PER_CLIENT_CACHE_TABLES — a factory "
+        "reset will leave the previous company's cached briefing narrative."
+    )
 
     for table in PER_CLIENT_CACHE_TABLES:
         assert table in _BLANK_WIPE_TABLES, (

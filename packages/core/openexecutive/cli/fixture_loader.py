@@ -76,8 +76,14 @@ _SAFE_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 # hand-written table list — so this was fixed in one and still live in the other
 # two. They now all consume this constant: `clients.slots._BLANK_WIPE_TABLES`
 # (client switch into a blank/seed slot), `reset_all_state` (factory reset), and
-# `_seed_episodic_memory` (fixture load). Any new per-company cache table goes
-# here, once.
+# `_apply_state_from_source` (fixture load AND unload). Any new per-company
+# cache table goes here, once.
+#
+# The fixture-path wipe belongs in `_apply_state_from_source`, NOT in
+# `_seed_episodic_memory`: that seeder returns early when the fixture has no
+# readable `memory.json`, and `load_fixture` only requires `profile.yaml` — so
+# such a fixture swaps the company while skipping a wipe placed inside the
+# seeder.
 #
 # Not included, deliberately: `generated_fixtures` (operator-level, see
 # `slots._GLOBAL_TABLES`) and `architecture_sections` (repo-derived, keyed by a
@@ -496,6 +502,29 @@ async def _apply_state_from_source(source_dir: Path, settings: Any) -> dict[str,
     monitoring_cleared = _delete_all_rows(
         EPISODIC_DB_PATH, ("external_signals", "watchlist")
     )
+
+    # ── 5b. Wipe the derived per-company caches ────────────────────────────
+    # Same leak class as the watchlist above, and it lives here — beside the
+    # other unconditional wipes — rather than in ``_seed_episodic_memory``,
+    # because that seeder returns early on a fixture whose ``memory.json`` is
+    # absent or unparseable. ``load_fixture`` only requires ``profile.yaml``,
+    # so such a fixture still swaps the company; wiping inside the seeder
+    # would skip exactly those loads and serve the outgoing company's
+    # narrative under the incoming one. Nothing here is conditional on the
+    # fixture's contents.
+    #
+    # Both caches CREATE TABLE lazily on first put, so a DB that has never
+    # served a briefing lacks them and _delete_all_rows — which is not
+    # per-table existence-guarded — would raise mid-wipe. Initialize first,
+    # exactly as the monitoring schema is handled above. Idempotent.
+    from openexecutive.briefing import narrative_cache
+    from openexecutive.people import insights_cache
+
+    if EPISODIC_DB_PATH.exists():
+        narrative_cache.initialize_db(EPISODIC_DB_PATH)
+        insights_cache.initialize_db(EPISODIC_DB_PATH)
+    caches_cleared = _delete_all_rows(EPISODIC_DB_PATH, PER_CLIENT_CACHE_TABLES)
+    logger.info("fixture: cleared derived per-company caches: %s", caches_cleared)
 
     # ── 6. Reset the periodic research skip-if-unchanged gate ───────────────
     # The skip gate reads the last run's state_hash from audit_log; load/unload
@@ -1166,18 +1195,6 @@ def _seed_episodic_memory(memory_path: Path, settings: Any) -> dict[str, int]:
         )
         if alerts_table_exists:
             conn.execute("DELETE FROM alerts")
-
-        # Derived per-company caches. Without this, loading a fixture over a
-        # live company leaves that company's cached briefing narrative in
-        # place and the demo's /today renders it verbatim — the surface most
-        # likely to be screen-shared. Same existence guard as alerts above:
-        # a minimal/legacy DB may not have these tables yet.
-        for cache_table in PER_CLIENT_CACHE_TABLES:
-            if conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                (cache_table,),
-            ).fetchone():
-                conn.execute(f"DELETE FROM {cache_table}")  # noqa: S608 — fixed tuple
 
         decisions = data.get("decisions", [])
         for row in decisions:
