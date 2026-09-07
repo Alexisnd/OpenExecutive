@@ -17,6 +17,7 @@ from openexecutive.monitoring.models import WatchlistItem
 from openexecutive.monitoring.sources.base import feed_text_published_at
 from openexecutive.monitoring.sources.vendor_status import (
     VendorStatusSource,
+    _parse_feed,
     _is_open,
     _latest_status,
     _make_dedup_key,
@@ -202,14 +203,87 @@ def test_a_label_past_the_scan_head_fails_closed() -> None:
     assert _latest_status(body, "") == ""
 
 
-def test_structural_label_is_used_when_markup_never_reaches_the_text() -> None:
-    """An xhtml <content> is parsed into elements, so the tags are gone by
-    the time the body is text — the label comes from the element tree."""
-    assert _latest_status("Sep 7, 19:07 UTCInvestigating - looking.", "x",
-                          "Investigating") == "investigating"
-    # …and it is still only consulted when the text carries no markup.
-    assert _latest_status("<p><strong>Resolved</strong> - done.</p>", "x",
-                          "Investigating") == "resolved"
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        # A real parser, so none of these read a LATER (older, and so
+        # nearly always open) label by mistake. Each line was a way a
+        # resolved incident reported itself live.
+        ("<p><b>Resolved</b> - fixed.</p>"
+         "<p><strong>Investigating</strong> - looking.</p>", "resolved"),
+        ("<!-- <strong>Investigating</strong> -->"
+         "<p><strong>Resolved</strong> - fixed.</p>", "resolved"),
+        ('<p><a href="/x?q=<strong>Investigating</strong>">Resolved</a>'
+         " - fixed.</p>", ""),
+        ("<p><strong><em>Resolved</em></strong> - fixed.</p>"
+         "<p><strong>Investigating</strong> - looking.</p>", "resolved"),
+        ('<p><strong class="hl">Resolved</strong> - fixed.</p>'
+         "<p><strong>Investigating</strong> - looking.</p>", "resolved"),
+        # The newest update carries no label, or an empty one: stop at the
+        # end of its block rather than reading the previous update's.
+        ("<p>Resolved - this incident has been resolved.</p>"
+         "<p><strong>Investigating</strong> - looking.</p>", ""),
+        ("<p><strong></strong> - x.</p>"
+         "<p><strong>Investigating</strong> - looking.</p>", ""),
+        # A close tag with a space is valid HTML and must not mute a live
+        # outage.
+        ("<p><strong>Investigating</strong > - live.</p>", "investigating"),
+    ],
+)
+def test_only_the_newest_label_decides(body: str, expected: str) -> None:
+    assert _latest_status(body, "") == expected
+
+
+def test_xhtml_body_reads_only_its_newest_update() -> None:
+    """The shape `_entry_body` re-serialises: an xhtml <content> holds real
+    elements, so the tags never reach us as text. A multi-update body is
+    the case that matters — with one update, "read only the newest" is
+    vacuous."""
+    def _feed(newest: str) -> bytes:
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>tag:status.example.com,2005:Incident/5</id>
+    <updated>2026-09-07T11:30:00Z</updated>
+    <link rel="alternate" href="https://status.example.com/incidents/5"/>
+    <title>Elevated errors</title>
+    <content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">
+      <p><small>12:00 UTC</small><br/>{newest}</p>
+      <p><small>09:00 UTC</small><br/><strong>Investigating</strong> - looking.</p>
+    </div></content>
+  </entry>
+</feed>""".encode()
+
+    labelled = _parse_feed(_feed("<strong>Resolved</strong> - fixed."))[0]
+    assert _latest_status(labelled["body"], labelled["title"]) == "resolved"
+
+    # Newest update unlabelled: must NOT fall through to the older
+    # "Investigating", which would promote a resolved incident at HIGH.
+    unlabelled = _parse_feed(_feed("Resolved - this incident has been resolved."))[0]
+    assert _latest_status(unlabelled["body"], unlabelled["title"]) == ""
+
+
+def test_label_never_comes_from_a_different_element_than_the_body() -> None:
+    """Body and label must be one element's: reading text from <content>
+    while taking the label from <summary> reported the status of an
+    element whose text was never used."""
+    feed = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>tag:status.example.com,2005:Incident/6</id>
+    <updated>2026-09-07T11:30:00Z</updated>
+    <link rel="alternate" href="https://status.example.com/incidents/6"/>
+    <title>Elevated errors</title>
+    <content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">
+      <p>Jun 1 12:00 UTC Resolved - all clear.</p>
+    </div></content>
+    <summary type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">
+      <p><b>Monitoring</b> - watching.</p>
+    </div></summary>
+  </entry>
+</feed>"""
+    entry = _parse_feed(feed)[0]
+    assert _latest_status(entry["body"], entry["title"]) == ""
 
 
 def test_is_open_fails_closed_on_unknown_status() -> None:

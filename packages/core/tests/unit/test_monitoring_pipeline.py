@@ -1026,15 +1026,18 @@ def test_status_scan_is_linear_on_a_hostile_body() -> None:
     is a full-process stall from anyone who controls a watched URL."""
     from openexecutive.monitoring.sources.vendor_status import _latest_status
 
-    hostile = "<strong>" + " " * 7_991 + "."
-    started = time.perf_counter()
-    assert _latest_status(hostile, "") == ""
-    elapsed = time.perf_counter() - started
-    # The label text is now bounded by str.find rather than a regex, so
-    # this runs in microseconds; the vulnerable pattern took ~3s. A 0.5s
-    # budget is ~1000x the real cost and still catches a regression on a
-    # runner several times faster than this one — 2.0s would not have.
-    assert elapsed < 0.5, f"status scan took {elapsed:.2f}s — check for backtracking"
+    # Both shapes: a long whitespace run inside a label (the original
+    # 3.4s payload) and a body that is nothing but unterminated opening
+    # tags, which a later `<strong\b[^>]*>` pattern scanned quadratically
+    # at 3.7ms/entry — 370ms per 100-entry feed on the API's event loop.
+    for hostile in ("<strong>" + " " * 7_991 + ".", ("<strong " * 1_000)[:8_000]):
+        started = time.perf_counter()
+        assert _latest_status(hostile, "") == ""
+        elapsed = time.perf_counter() - started
+        # An HTML parser walks these in well under a millisecond. The
+        # budget is ~1000x that and still an order of magnitude under the
+        # slowest regression above, on a runner far faster than this one.
+        assert elapsed < 0.1, f"status scan took {elapsed:.3f}s — not linear"
 
 
 def test_scan_that_loses_baseline_race_does_not_replay_back_catalogue(
