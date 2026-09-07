@@ -97,22 +97,24 @@ class CompanyProfile(BaseModel):
         #   silently revert to the umask default.
         # - fsync file and directory: a hard crash between write and
         #   rename must not leave a zero-length profile.
-        # Stale temps from an earlier crash are swept first so a
-        # 0644 copy of the financials never lingers in company/.
-        for stale in path.parent.glob(f".tmp-*-{path.name}"):
-            with contextlib.suppress(OSError):
-                stale.unlink()
+        # There is deliberately no sweep of stale temps: a sweep cannot
+        # tell a crashed writer's leftover from another process's
+        # in-flight file, and unlinking the latter makes its rename fail.
+        # A leftover is 0600 clutter, not a leak.
         tmp_path = path.with_name(f".tmp-{os.getpid()}-{secrets.token_hex(4)}-{path.name}")
         existing_mode: int | None = None
         with contextlib.suppress(OSError):
-            existing_mode = stat.S_IMODE(path.stat().st_mode)
+            # lstat: never take the mode from a symlink's target.
+            existing_mode = stat.S_IMODE(path.lstat().st_mode)
 
         def _exclusive(p: str, flags: int) -> int:
             return os.open(p, flags | os.O_EXCL, 0o600 if existing_mode is None else existing_mode)
 
         try:
             with open(tmp_path, "w", encoding="utf-8", opener=_exclusive) as f:
-                if existing_mode is not None:
+                if existing_mode is not None and hasattr(os, "fchmod"):
+                    # os.open applies the umask; fchmod restores the exact
+                    # mode the destination had. Unix only.
                     os.fchmod(f.fileno(), existing_mode)
                 yaml.dump(data, f, default_flow_style=False, sort_keys=True)
                 f.flush()

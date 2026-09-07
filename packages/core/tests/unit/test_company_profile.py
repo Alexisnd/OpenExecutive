@@ -137,19 +137,48 @@ def test_save_to_yaml_is_atomic(tmp_path: Path, monkeypatch):
     assert [p.name for p in tmp_path.iterdir()] == ["profile.yaml"], "temp file left behind"
 
 
-def test_save_to_yaml_preserves_mode_and_sweeps_stale_temps(tmp_path: Path):
-    """Rename creates a new inode; an operator's chmod must survive it."""
+def test_save_to_yaml_preserves_mode(tmp_path: Path):
+    """Rename creates a new inode; an operator's chmod must survive it.
+
+    0o664 rather than 0o600 on purpose: a fresh profile is already created
+    0o600, and 0o600 is umask-invariant, so it would exercise neither the
+    stat nor the fchmod that carry the mode across.
+    """
     import os
     import stat
 
     path = tmp_path / "profile.yaml"
     CompanyProfile(name="Before").save_to_yaml(path)
-    os.chmod(path, 0o600)
-    stale = tmp_path / ".tmp-1-deadbeef-profile.yaml"
-    stale.write_text("leftover from a crash", encoding="utf-8")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600, "fresh profile should be private"
+    os.chmod(path, 0o664)
 
     CompanyProfile(name="After").save_to_yaml(path)
 
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.stat().st_mode) == 0o664
     assert CompanyProfile.load_from_yaml(path).name == "After"
+    assert [p.name for p in tmp_path.iterdir()] == ["profile.yaml"]
+
+
+def test_concurrent_saves_do_not_break_each_other(tmp_path: Path):
+    """Two writers on one path must both succeed (last writer wins)."""
+    import threading
+
+    path = tmp_path / "profile.yaml"
+    errors: list[BaseException] = []
+
+    def _worker(name: str) -> None:
+        try:
+            for _ in range(40):
+                CompanyProfile(name=name).save_to_yaml(path)
+        except BaseException as exc:  # noqa: BLE001 - collecting for the assert
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_worker, args=(f"w{i}",)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    assert CompanyProfile.load_from_yaml(path).name.startswith("w")
     assert [p.name for p in tmp_path.iterdir()] == ["profile.yaml"]

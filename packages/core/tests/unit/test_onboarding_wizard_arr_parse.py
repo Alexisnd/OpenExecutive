@@ -120,3 +120,19 @@ def test_long_whitespace_run_is_linear_time() -> None:
 
     assert "annual_revenue_arr" not in profile
     assert "burn_rate_monthly" not in profile["financials"]
+
+
+def test_long_digit_run_without_commas_is_linear_time() -> None:
+    """Pure digits hit the runway and headcount parsers, not only ARR/burn.
+
+    `(\\d+)\\s*month` without a lookbehind was quadratic (750ms at 10k),
+    and int() on a 5000-digit headcount raises at Python's digit limit.
+    """
+    text = "9" * 200_000
+    profile = build_profile_from_answers(
+        {"business_model": text, "financials": text, "headcount_and_founding": text}
+    )
+
+    assert "annual_revenue_arr" not in profile
+    assert profile["financials"] == {}
+    assert profile["headcount"] == 999_999_999

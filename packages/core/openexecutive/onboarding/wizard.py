@@ -181,7 +181,8 @@ def build_profile_from_answers(answers: dict[str, Any]) -> dict[str, Any]:
         import re
 
         text = answers["headcount_and_founding"]
-        nums = re.findall(r"\d+", text)
+        # Bounded so int() can never hit its digit limit on a hostile run.
+        nums = re.findall(r"\d{1,9}", text)
         if nums:
             if len(nums) >= 2:
                 profile["headcount"] = int(nums[0])
@@ -278,7 +279,9 @@ def build_profile_from_answers(answers: dict[str, Any]) -> dict[str, Any]:
         burn_match = re.search(
             r"\$?(?<![\d,])(\d[\d,]*)\s*(?:[Kk]\s*)?(?:monthly|/month|per month|burn)", text
         )
-        runway_match = re.search(r"(\d+)\s*month", text)
+        # Same lookbehind as the other two: without it every digit of a
+        # long run is a candidate start and the search is quadratic.
+        runway_match = re.search(r"(?<!\d)(\d+)\s*month", text)
 
         fin: dict[str, Any] = {}
         if burn_match:
