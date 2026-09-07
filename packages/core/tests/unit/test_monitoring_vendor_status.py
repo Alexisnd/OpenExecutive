@@ -1,0 +1,442 @@
+"""Unit tests for the vendor_status adapter (issue #90).
+
+The adapter used to key its ``dedup_key`` on the incident id alone, which
+made every suppression permanent and kept it outside both #80 freshness
+gates — so a new watch replayed the vendor's whole resolved archive as
+HIGH alerts. These tests pin the three moving parts of the fix: the key
+now carries ``<updated>``, ``published_at`` is parsed from the feed, and
+``promote_on_baseline`` exempts incidents that are still open from the
+first-poll baseline.
+"""
+from __future__ import annotations
+
+import pytest
+
+from openexecutive.alerts.models import AlertSeverity
+from openexecutive.monitoring.models import WatchlistItem
+from openexecutive.monitoring.sources.base import feed_text_published_at
+from openexecutive.monitoring.sources.vendor_status import (
+    VendorStatusSource,
+    _is_open,
+    _latest_status,
+    _make_dedup_key,
+)
+
+# --------------------------------------------------------------------- #
+# Helpers / fixtures
+# --------------------------------------------------------------------- #
+
+
+def _make_item(
+    *,
+    slug: str = "vendor-stripe",
+    target: str = "https://status.stripe.com/history.atom",
+    config: dict | None = None,
+    trigger: dict | None = None,
+) -> WatchlistItem:
+    return WatchlistItem(
+        id=1,
+        slug=slug,
+        signal_type="vendor_status",
+        target=target,
+        config_json=config or {},
+        trigger_json=trigger or {},
+    )
+
+
+def _install_feed(monkeypatch: pytest.MonkeyPatch, body: bytes) -> None:
+    async def fake_fetch(url: str, max_bytes: int) -> bytes:
+        return body
+
+    monkeypatch.setattr(
+        "openexecutive.monitoring.sources.vendor_status.fetch_bounded", fake_fetch
+    )
+    monkeypatch.setattr(
+        "openexecutive.monitoring.sources.vendor_status.validate_target_url",
+        lambda u: (True, ""),
+    )
+
+
+def _atom_entry(
+    *, incident: str, title: str, updated: str, body: str,
+) -> str:
+    return f"""
+  <entry>
+    <id>tag:status.stripe.com,2005:Incident/{incident}</id>
+    <published>2026-09-05T09:00:00Z</published>
+    <updated>{updated}</updated>
+    <link rel="alternate" type="text/html"
+          href="https://status.stripe.com/incidents/{incident}?utm_source=feed"/>
+    <title>{title}</title>
+    <content type="html">{body}</content>
+  </entry>"""
+
+
+def _atom_feed(*entries: str) -> bytes:
+    joined = "".join(entries)
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Stripe Status</title>
+  <updated>2026-09-07T12:00:00Z</updated>{joined}
+</feed>
+""".encode()
+
+
+# An incident still in progress: Statuspage lists the newest update first,
+# so "Monitoring" is its current state even though "Investigating" follows.
+_OPEN_BODY = (
+    "&lt;p&gt;&lt;small&gt;Sep 7, 11:30 UTC&lt;/small&gt;&lt;br&gt;"
+    "&lt;strong&gt;Monitoring&lt;/strong&gt; - A fix has been applied.&lt;/p&gt;"
+    "&lt;p&gt;&lt;strong&gt;Investigating&lt;/strong&gt; - Looking into it.&lt;/p&gt;"
+)
+_RESOLVED_BODY = (
+    "&lt;p&gt;&lt;strong&gt;Resolved&lt;/strong&gt; - This incident is resolved.&lt;/p&gt;"
+    "&lt;p&gt;&lt;strong&gt;Investigating&lt;/strong&gt; - Looking into it.&lt;/p&gt;"
+)
+
+_OPEN_ENTRY = _atom_entry(
+    incident="2001", title="Elevated API error rates",
+    updated="2026-09-07T11:30:00Z", body=_OPEN_BODY,
+)
+_RESOLVED_ENTRY = _atom_entry(
+    incident="1004", title="Dashboard latency",
+    updated="2026-03-02T18:00:00Z", body=_RESOLVED_BODY,
+)
+
+_SAMPLE_ATOM = _atom_feed(_OPEN_ENTRY, _RESOLVED_ENTRY)
+
+_SAMPLE_RSS = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Twilio Status</title>
+    <item>
+      <guid>https://status.twilio.com/incidents/xyz</guid>
+      <title>SMS delivery delays</title>
+      <link>https://status.twilio.com/incidents/xyz?utm_source=feed</link>
+      <pubDate>Mon, 07 Sep 2026 11:30:00 +0000</pubDate>
+      <description>&lt;p&gt;&lt;strong&gt;Identified&lt;/strong&gt; - Root cause found.&lt;/p&gt;</description>
+    </item>
+  </channel>
+</rss>
+"""
+
+# AWS publishes one item per update and carries the resolution in the
+# title instead of Statuspage's per-update markup.
+_AWS_RSS = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Amazon Web Services Service Status</title>
+    <item>
+      <guid>http://status.aws.amazon.com/#ec2-us-east-1_1757251800</guid>
+      <title>Service is operating normally: [RESOLVED] Increased error rates</title>
+      <link>http://status.aws.amazon.com/</link>
+      <pubDate>Mon, 07 Sep 2026 12:10:00 PDT</pubDate>
+      <description>Between 9:00 AM and 11:30 AM PDT we experienced errors.</description>
+    </item>
+  </channel>
+</rss>
+"""
+
+
+# --------------------------------------------------------------------- #
+# Status parsing
+# --------------------------------------------------------------------- #
+
+
+# _latest_status sees the body AFTER the XML parser has unescaped it, so
+# these are the literal-markup forms of _OPEN_BODY / _RESOLVED_BODY above.
+_OPEN_BODY_TEXT = (
+    "<p><small>Sep 7, 11:30 UTC</small><br>"
+    "<strong>Monitoring</strong> - A fix has been applied.</p>"
+    "<p><strong>Investigating</strong> - Looking into it.</p>"
+)
+_RESOLVED_BODY_TEXT = (
+    "<p><strong>Resolved</strong> - This incident is resolved.</p>"
+    "<p><strong>Investigating</strong> - Looking into it.</p>"
+)
+
+
+@pytest.mark.parametrize(
+    ("body", "title", "expected"),
+    [
+        (_OPEN_BODY_TEXT, "Elevated API error rates", "monitoring"),
+        (_RESOLVED_BODY_TEXT, "Dashboard latency", "resolved"),
+        ("<p><strong>Investigating</strong> - digging in.</p>", "x", "investigating"),
+        ("<p><strong>Identified</strong> - found it.</p>", "x", "identified"),
+        ("<p><strong>Scheduled</strong> - maintenance window.</p>", "x", "scheduled"),
+        ("<p><strong>Completed</strong> - maintenance done.</p>", "x", "completed"),
+        ("<p><strong>Postmortem</strong> - write-up.</p>", "x", "postmortem"),
+        # Case and whitespace are the vendor's business, not ours.
+        ("<p><STRONG> resolved </STRONG> - done.</p>", "x", "resolved"),
+        # No markup at all: a label leading the body text still counts
+        # (xhtml <content>, or a vendor publishing plain-text updates).
+        ("Investigating - we are looking into it.", "x", "investigating"),
+        ("Completed: the maintenance window is over.", "x", "completed"),
+        # …but only at the start; mid-body prose must not be mined for one.
+        ("We were monitoring - then it recovered.", "x", ""),
+        # No per-update markup: fall back to the title marker (AWS).
+        ("plain text body", "[RESOLVED] Increased error rates", "resolved"),
+        # A <strong> that isn't a status label must not be mistaken for one.
+        ("<p><strong>Note</strong> - unrelated bold text.</p>", "x", ""),
+        ("", "", ""),
+    ],
+)
+def test_latest_status_reads_the_newest_update(
+    body: str, title: str, expected: str,
+) -> None:
+    assert _latest_status(body, title) == expected
+
+
+def test_is_open_fails_closed_on_unknown_status() -> None:
+    """An unrecognised status must NOT count as open: a vendor changing its
+    feed format must not be able to promote its whole archive at HIGH."""
+    assert _is_open("investigating") is True
+    assert _is_open("monitoring") is True
+    assert _is_open("resolved") is False
+    assert _is_open("postmortem") is False
+    assert _is_open("") is False
+    assert _is_open("nonsense") is False
+
+
+# --------------------------------------------------------------------- #
+# published_at parsing (sources.base.feed_text_published_at)
+# --------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2026-09-07T11:30:00Z", "2026-09-07T11:30:00+00:00"),
+        ("2026-09-07T04:30:00-07:00", "2026-09-07T11:30:00+00:00"),
+        ("Mon, 07 Sep 2026 11:30:00 +0000", "2026-09-07T11:30:00+00:00"),
+        ("Mon, 07 Sep 2026 11:30:00 GMT", "2026-09-07T11:30:00+00:00"),
+        # Naive values are read as UTC, like every other date path here.
+        ("2026-09-07T11:30:00", "2026-09-07T11:30:00+00:00"),
+        ("", None),
+        (None, None),
+        ("not a date", None),
+    ],
+)
+def test_feed_text_published_at(raw: str | None, expected: str | None) -> None:
+    assert feed_text_published_at(raw) == expected
+
+
+# --------------------------------------------------------------------- #
+# Dedup key
+# --------------------------------------------------------------------- #
+
+
+def test_dedup_key_changes_with_updated() -> None:
+    """The whole fix: an incident id is stable for the incident's life, so
+    the key must carry its update stamp or a suppression is permanent."""
+    first = _make_dedup_key("vendor-stripe", "Incident/2001", "2026-09-07T09:00:00Z")
+    same = _make_dedup_key("vendor-stripe", "Incident/2001", "2026-09-07T09:00:00Z")
+    later = _make_dedup_key("vendor-stripe", "Incident/2001", "2026-09-07T11:30:00Z")
+    other_row = _make_dedup_key("vendor-aws", "Incident/2001", "2026-09-07T09:00:00Z")
+
+    assert first == same  # an unchanged feed still dedups
+    assert first != later  # a status change surfaces again
+    assert first != other_row  # rows stay independent
+    assert later.startswith("vendor_status:")
+
+
+def test_dedup_key_without_updated_is_stable_per_incident() -> None:
+    """A feed with no <updated> degrades to a per-incident key rather than
+    one that changes every poll — which would re-alert forever."""
+    a = _make_dedup_key("vendor-x", "Incident/7", "")
+    b = _make_dedup_key("vendor-x", "Incident/7", "")
+    assert a == b
+
+
+# --------------------------------------------------------------------- #
+# poll()
+# --------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_poll_emits_status_published_at_and_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_feed(monkeypatch, _SAMPLE_ATOM)
+    src = VendorStatusSource()
+    item = _make_item(config={"vendor_label": "Stripe"})
+
+    signals = await src.poll(item)
+
+    assert len(signals) == 2
+    live, archived = signals
+    assert live.normalized_summary == "[Stripe] Elevated API error rates"
+    assert live.raw_payload["status"] == "monitoring"
+    assert live.published_at == "2026-09-07T11:30:00+00:00"
+    assert live.severity_hint is AlertSeverity.HIGH
+    # Tracking query stripped from the click-through URL.
+    assert live.provenance_url == "https://status.stripe.com/incidents/2001"
+    assert archived.raw_payload["status"] == "resolved"
+    assert archived.published_at == "2026-03-02T18:00:00+00:00"
+    # source_external_id stays the incident, so both states of one incident
+    # remain findable together; only dedup_key distinguishes them.
+    assert live.source_external_id.endswith("Incident/2001")
+    assert live.dedup_key != archived.dedup_key
+
+
+@pytest.mark.asyncio
+async def test_identical_poll_produces_identical_dedup_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-polling an unchanged feed must dedup — the status page returns
+    the same entries every five minutes."""
+    _install_feed(monkeypatch, _SAMPLE_ATOM)
+    src = VendorStatusSource()
+    item = _make_item()
+
+    first = await src.poll(item)
+    second = await src.poll(item)
+
+    assert [s.dedup_key for s in first] == [s.dedup_key for s in second]
+
+
+@pytest.mark.asyncio
+async def test_incident_update_mints_a_new_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same incident, one status update later: a new key, so it re-fires."""
+    src = VendorStatusSource()
+    item = _make_item()
+
+    _install_feed(monkeypatch, _atom_feed(_OPEN_ENTRY))
+    before = (await src.poll(item))[0]
+
+    resolved_now = _atom_entry(
+        incident="2001", title="Elevated API error rates",
+        updated="2026-09-07T13:05:00Z", body=_RESOLVED_BODY,
+    )
+    _install_feed(monkeypatch, _atom_feed(resolved_now))
+    after = (await src.poll(item))[0]
+
+    assert before.source_external_id == after.source_external_id
+    assert before.dedup_key != after.dedup_key
+    assert before.raw_payload["status"] == "monitoring"
+    assert after.raw_payload["status"] == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_promote_on_baseline_exempts_only_open_incidents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first-poll contract: an open incident is live news, the resolved
+    archive is not."""
+    _install_feed(monkeypatch, _SAMPLE_ATOM)
+    src = VendorStatusSource()
+    item = _make_item()
+
+    live, archived = await src.poll(item)
+
+    assert src.seed_on_first_poll is True
+    assert src.promote_on_baseline(live, item) is True
+    assert src.promote_on_baseline(archived, item) is False
+
+
+@pytest.mark.asyncio
+async def test_unknown_status_is_baselined_on_first_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A feed whose format we don't recognise must not promote its archive.
+    Nothing is lost: the next <updated> bump mints a new key."""
+    unknown = _atom_entry(
+        incident="9", title="Something happened",
+        updated="2026-09-07T11:30:00Z", body="plain text, no markup",
+    )
+    _install_feed(monkeypatch, _atom_feed(unknown))
+    src = VendorStatusSource()
+    item = _make_item()
+
+    signal = (await src.poll(item))[0]
+
+    assert signal.raw_payload["status"] == ""
+    assert src.promote_on_baseline(signal, item) is False
+
+
+@pytest.mark.asyncio
+async def test_rss_status_and_pubdate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Statuspage's RSS variant carries the same markup in <description>."""
+    _install_feed(monkeypatch, _SAMPLE_RSS)
+    src = VendorStatusSource()
+    item = _make_item(target="https://status.twilio.com/history.rss")
+
+    signal = (await src.poll(item))[0]
+
+    assert signal.raw_payload["status"] == "identified"
+    assert signal.published_at == "2026-09-07T11:30:00+00:00"
+    assert src.promote_on_baseline(signal, item) is True
+    # No vendor_label configured → derived from the host.
+    assert signal.normalized_summary.startswith("[twilio] ")
+
+
+@pytest.mark.asyncio
+async def test_aws_rss_title_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_feed(monkeypatch, _AWS_RSS)
+    src = VendorStatusSource()
+    item = _make_item(target="https://status.aws.amazon.com/rss/all.rss")
+
+    signal = (await src.poll(item))[0]
+
+    assert signal.raw_payload["status"] == "resolved"
+    assert src.promote_on_baseline(signal, item) is False
+    assert signal.published_at is not None
+
+
+@pytest.mark.asyncio
+async def test_xhtml_content_still_yields_a_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Atom entry whose <content> holds real child elements (type=xhtml)
+    rather than escaped markup — findtext would return only the leading
+    text and lose the label."""
+    feed = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>tag:status.example.com,2005:Incident/5</id>
+    <updated>2026-09-07T11:30:00Z</updated>
+    <link rel="alternate" href="https://status.example.com/incidents/5"/>
+    <title>Partial outage</title>
+    <content type="xhtml"><p><strong>Investigating</strong> - looking.</p></content>
+  </entry>
+</feed>
+"""
+    _install_feed(monkeypatch, feed)
+    src = VendorStatusSource()
+
+    signal = (await src.poll(_make_item()))[0]
+
+    assert signal.raw_payload["status"] == "investigating"
+
+
+@pytest.mark.asyncio
+async def test_entry_without_id_or_link_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unchanged behaviour: no stable upstream id → no reliable dedup."""
+    feed = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title>Anonymous incident</title>
+    <updated>2026-09-07T11:30:00Z</updated>
+  </entry>
+</feed>
+"""
+    _install_feed(monkeypatch, feed)
+    assert await VendorStatusSource().poll(_make_item()) == []
+
+
+@pytest.mark.asyncio
+async def test_keyword_trigger_still_filters_on_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_feed(monkeypatch, _SAMPLE_ATOM)
+    src = VendorStatusSource()
+    item = _make_item(trigger={"keywords": ["api"]})
+
+    live, archived = await src.poll(item)
+
+    assert src.matches_trigger(live, item) is True
+    assert src.matches_trigger(archived, item) is False

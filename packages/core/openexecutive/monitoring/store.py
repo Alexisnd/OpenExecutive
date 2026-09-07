@@ -123,6 +123,16 @@ def initialize_db(db_path: Path | None = None) -> None:
                 text_snapshot TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL
             );
+
+            -- One row per one-time data migration that has been applied.
+            -- There is no migration framework in this repo, and column
+            -- guards (_ensure_column) only work for migrations that add a
+            -- column; a pure data fix-up needs its own marker to run
+            -- exactly once. See _apply_once.
+            CREATE TABLE IF NOT EXISTS monitoring_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
         """)
         # Additive migration for DBs created before enrichment landed.
         # ``CREATE TABLE IF NOT EXISTS`` above is a no-op on an existing
@@ -150,6 +160,7 @@ def initialize_db(db_path: Path | None = None) -> None:
         if not _has_column(conn, "watchlist", "baselined_at"):
             _migrate_baselined_at(conn)
         # Add future migrations BELOW, not inside the guard above.
+        _migrate_vendor_status_rekey(conn)
 
 
 def _migrate_baselined_at(conn: sqlite3.Connection) -> None:
@@ -164,6 +175,66 @@ def _migrate_baselined_at(conn: sqlite3.Connection) -> None:
                 "UPDATE watchlist SET baselined_at = last_polled_at "
                 "WHERE baselined_at IS NULL AND last_polled_at IS NOT NULL"
             )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+_MIGRATION_VENDOR_STATUS_REKEY = "vendor_status_dedup_rekey_90"
+
+
+def _apply_once(conn: sqlite3.Connection, name: str) -> bool:
+    """Claim a one-time data migration. True only for the caller that won.
+
+    Must be called INSIDE the caller's transaction so the claim and the
+    migration's own writes commit or roll back together — a marker without
+    its data change would skip the migration for good.
+    """
+    claimed = conn.execute(
+        "INSERT OR IGNORE INTO monitoring_migrations (name, applied_at) "
+        "VALUES (?, ?)",
+        (name, datetime.now(UTC).isoformat()),
+    )
+    return claimed.rowcount > 0
+
+
+def _migrate_vendor_status_rekey(conn: sqlite3.Connection) -> None:
+    """One-time: let ``vendor_status`` rows re-seed after the #90 rekey.
+
+    ``vendor_status`` dedup keys used to be ``sha256(slug, entry id)`` and
+    are now ``sha256(slug, entry id, <updated>)``, so on the upgrade tick
+    every entry in a vendor's history feed hashes to a key the DB has
+    never seen. For rows already stamped ``baselined_at`` (the #80
+    backfill stamped every previously-polled row) that would replay the
+    archive as HIGH alerts — the very bug #90 is about, just once.
+
+    Clearing the stamp makes that tick a first poll under the new scheme:
+    the resolved archive is recorded as ``suppressed_baseline`` and only
+    incidents that are still open are promoted. Signal rows are left
+    alone — the old keys are inert, and deleting them would lose the
+    audit trail of what the row surfaced before the upgrade.
+    """
+    already = conn.execute(
+        "SELECT 1 FROM monitoring_migrations WHERE name = ?",
+        (_MIGRATION_VENDOR_STATUS_REKEY,),
+    ).fetchone()
+    if already is not None:
+        # Steady-state boot: no write transaction, so startup never
+        # contends for the write lock on the shared episodic_memory.db.
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if _apply_once(conn, _MIGRATION_VENDOR_STATUS_REKEY):
+            reset = conn.execute(
+                "UPDATE watchlist SET baselined_at = NULL "
+                "WHERE signal_type = 'vendor_status' AND baselined_at IS NOT NULL"
+            )
+            if reset.rowcount:
+                logger.info(
+                    "monitoring.store: re-seeding %d vendor_status row(s) after "
+                    "the #90 dedup rekey", reset.rowcount,
+                )
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")

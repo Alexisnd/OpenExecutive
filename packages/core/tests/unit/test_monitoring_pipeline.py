@@ -10,6 +10,7 @@ pipeline orchestration code instead.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -62,12 +63,24 @@ class _FakeSource:
     default_poll_interval_minutes: int = 5
     seed_on_first_poll: bool = False
 
-    def __init__(self, signals: list[Signal], *, seed: bool = False) -> None:
+    def __init__(
+        self,
+        signals: list[Signal],
+        *,
+        seed: bool = False,
+        promote: Any = None,
+    ) -> None:
         self._signals = signals
         self.calls = 0
         self.seed_on_first_poll = seed
         # Optional per-signal trigger predicate (default: everything matches).
         self.match: Any = None
+        # The optional ``promote_on_baseline`` hook (sources.base.Source) is
+        # bound as an INSTANCE attribute only when a test asks for one, so
+        # the default fake has no such attribute at all — that is the shape
+        # rss / edgar present to the pipeline's getattr lookup.
+        if promote is not None:
+            self.promote_on_baseline = promote  # type: ignore[attr-defined]
 
     async def poll(
         self, item: WatchlistItem, *, db_path: Path | None = None
@@ -91,8 +104,10 @@ def install_fake_source(monkeypatch: pytest.MonkeyPatch):
     original = SOURCE_REGISTRY.get("vendor_status")
     installed: list[_FakeSource] = []
 
-    def _set(signals: list[Signal], *, seed: bool = False) -> _FakeSource:
-        fake = _FakeSource(signals, seed=seed)
+    def _set(
+        signals: list[Signal], *, seed: bool = False, promote: Any = None,
+    ) -> _FakeSource:
+        fake = _FakeSource(signals, seed=seed, promote=promote)
         SOURCE_REGISTRY["vendor_status"] = fake  # type: ignore[assignment]
         installed.append(fake)
         return fake
@@ -511,6 +526,174 @@ def test_first_poll_baselines_seeding_source(
     assert outcomes["vendor_status:e1"] == OUTCOME_SUPPRESSED_BASELINE  # untouched
 
 
+def test_baseline_exempt_entries_are_promoted_on_the_first_poll(
+    db: Path,
+    install_fake_source,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``promote_on_baseline`` (issue #90): an adapter may carve live news
+    out of its own first-poll baseline. The archive is still recorded and
+    never promoted; the exempt entry runs the ordinary cascade."""
+    promoted = _install_promotion_recorder(monkeypatch)
+    _insert_feed(db, "vendor-stripe")
+    install_fake_source(
+        [
+            _make_signal(dedup_key="vendor_status:open", published_at=_iso_days_ago(0.1)),
+            _make_signal(dedup_key="vendor_status:old1", published_at=_iso_days_ago(120)),
+            _make_signal(dedup_key="vendor_status:old2", published_at=_iso_days_ago(200)),
+        ],
+        seed=True,
+        promote=lambda signal, item: signal.dedup_key.endswith(":open"),
+    )
+
+    written = asyncio.run(mp.run_external_monitor_scan(db_path=db))
+
+    assert written == 3  # archive AND the exempt entry are recorded
+    assert [e.external_id for e in promoted] == ["vendor_status:open"]
+    outcomes = {r["dedup_key"]: r["processed_outcome"] for r in ms.list_recent_signals(db_path=db)}
+    assert outcomes == {
+        "vendor_status:open": OUTCOME_ALERTED,
+        "vendor_status:old1": OUTCOME_SUPPRESSED_BASELINE,
+        "vendor_status:old2": OUTCOME_SUPPRESSED_BASELINE,
+    }
+    item = ms.list_watchlist(db_path=db)[0]
+    assert item.baselined_at is not None  # the row is seeded, so tick 2 is normal
+
+    # Tick 2: the archive stays put, and the same entries don't re-fire.
+    ms.mark_polled(item.id or 0, datetime(2000, 1, 1, tzinfo=UTC), db_path=db)
+    asyncio.run(mp.run_external_monitor_scan(db_path=db))
+    assert [e.external_id for e in promoted] == ["vendor_status:open"]
+
+
+_VENDOR_ATOM = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>tag:status.stripe.com,2005:Incident/2001</id>
+    <updated>{open_updated}</updated>
+    <link rel="alternate" href="https://status.stripe.com/incidents/2001"/>
+    <title>Elevated API error rates</title>
+    <content type="html">&lt;p&gt;&lt;strong&gt;{open_status}&lt;/strong&gt; - {open_note}&lt;/p&gt;</content>
+  </entry>
+  <entry>
+    <id>tag:status.stripe.com,2005:Incident/1004</id>
+    <updated>2026-03-02T18:00:00+00:00</updated>
+    <link rel="alternate" href="https://status.stripe.com/incidents/1004"/>
+    <title>Dashboard latency</title>
+    <content type="html">&lt;p&gt;&lt;strong&gt;Resolved&lt;/strong&gt; - Fixed months ago.&lt;/p&gt;</content>
+  </entry>
+</feed>
+"""
+
+
+def _install_vendor_feed(monkeypatch: pytest.MonkeyPatch, body: str) -> None:
+    """Point the REAL vendor_status adapter at a canned feed."""
+    async def fake_fetch(url: str, max_bytes: int) -> bytes:
+        return body.encode()
+
+    monkeypatch.setattr(
+        "openexecutive.monitoring.sources.vendor_status.fetch_bounded", fake_fetch
+    )
+    monkeypatch.setattr(
+        "openexecutive.monitoring.sources.vendor_status.validate_target_url",
+        lambda u: (True, ""),
+    )
+
+
+def test_vendor_status_first_poll_alerts_the_outage_not_the_archive(
+    db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end on the REAL adapter (issue #90's acceptance criteria):
+    a watch added mid-outage reports the outage and swallows the vendor's
+    resolved history, and the incident re-fires when its status changes."""
+    promoted = _install_promotion_recorder(monkeypatch)
+    _insert_feed(db, "vendor-stripe", target="https://status.stripe.com/history.atom")
+    _install_vendor_feed(monkeypatch, _VENDOR_ATOM.format(
+        open_updated=_iso_days_ago(0.02),
+        open_status="Investigating",
+        open_note="We are looking into elevated error rates.",
+    ))
+
+    asyncio.run(mp.run_external_monitor_scan(db_path=db))
+
+    outcomes = {
+        r["normalized_summary"]: r["processed_outcome"]
+        for r in ms.list_recent_signals(db_path=db)
+    }
+    assert outcomes == {
+        "[stripe] Elevated API error rates": OUTCOME_ALERTED,
+        "[stripe] Dashboard latency": OUTCOME_SUPPRESSED_BASELINE,
+    }
+    assert len(promoted) == 1
+
+    item = ms.list_watchlist(db_path=db)[0]
+
+    # Same feed again: nothing new, nothing re-fires.
+    ms.mark_polled(item.id or 0, datetime(2000, 1, 1, tzinfo=UTC), db_path=db)
+    asyncio.run(mp.run_external_monitor_scan(db_path=db))
+    assert len(promoted) == 1
+
+    # The incident resolves — a new <updated>, so a new dedup key, so the
+    # status change reaches the principal instead of being muted for good.
+    _install_vendor_feed(monkeypatch, _VENDOR_ATOM.format(
+        open_updated=_iso_days_ago(0.01),
+        open_status="Resolved",
+        open_note="Error rates are back to normal.",
+    ))
+    ms.mark_polled(item.id or 0, datetime(2000, 1, 1, tzinfo=UTC), db_path=db)
+    asyncio.run(mp.run_external_monitor_scan(db_path=db))
+    assert len(promoted) == 2
+
+
+def test_every_entry_exempt_still_stamps_the_baseline(
+    db: Path,
+    install_fake_source,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first poll where the adapter exempts everything (a vendor whose
+    every listed incident is open) must still claim the stamp — otherwise
+    the next tick would baseline the feed and swallow real news."""
+    promoted = _install_promotion_recorder(monkeypatch)
+    _insert_feed(db, "vendor-aws")
+    install_fake_source(
+        [_make_signal(dedup_key="vendor_status:live", published_at=_iso_days_ago(0.1))],
+        seed=True,
+        promote=lambda signal, item: True,
+    )
+
+    asyncio.run(mp.run_external_monitor_scan(db_path=db))
+
+    assert [e.external_id for e in promoted] == ["vendor_status:live"]
+    assert ms.list_watchlist(db_path=db)[0].baselined_at is not None
+
+
+def test_crashing_promote_on_baseline_falls_back_to_baseline(
+    db: Path,
+    install_fake_source,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hook that raises must not turn a first poll into a back-catalogue
+    replay — the same fail-quiet stance matches_trigger takes."""
+    promoted = _install_promotion_recorder(monkeypatch)
+    _insert_feed(db, "vendor-broken")
+
+    def _boom(signal: Signal, item: WatchlistItem) -> bool:
+        raise RuntimeError("hook is broken")
+
+    install_fake_source(
+        [_make_signal(dedup_key="vendor_status:x", published_at=_iso_days_ago(0.1))],
+        seed=True,
+        promote=_boom,
+    )
+
+    written = asyncio.run(mp.run_external_monitor_scan(db_path=db))
+
+    assert written == 1
+    assert promoted == []
+    outcomes = {r["dedup_key"]: r["processed_outcome"] for r in ms.list_recent_signals(db_path=db)}
+    assert outcomes == {"vendor_status:x": OUTCOME_SUPPRESSED_BASELINE}
+
+
 def test_failed_first_fetch_does_not_forfeit_baseline(
     db: Path,
     install_fake_source,
@@ -619,6 +802,35 @@ def test_baselined_at_backfilled_for_previously_polled_rows(tmp_path: Path) -> N
     by_slug = {i.slug: i for i in ms.list_watchlist(db_path=db_path)}
     assert by_slug["old-feed"].baselined_at == "2026-09-01T00:00:00+00:00"
     assert by_slug["never-polled"].baselined_at is None
+
+
+def test_vendor_status_rows_reseed_once_after_the_rekey(db: Path) -> None:
+    """Issue #90: vendor_status dedup keys now carry <updated>, so on the
+    upgrade tick every archive entry hashes to a key the DB has never seen.
+    Clearing ``baselined_at`` on exactly those rows makes that tick a first
+    poll (archive suppressed, open incidents promoted) instead of a replay
+    — and it must happen once, not on every boot."""
+    stamp = "2026-09-01T00:00:00+00:00"
+    vendor_id = _insert_feed(db, "vendor-stripe")
+    rss_id = _insert_feed(db, "acme-changelog", signal_type="rss")
+    for wl_id in (vendor_id, rss_id):
+        ms.record_baseline(wl_id, datetime.fromisoformat(stamp), [], db_path=db)
+
+    # The db fixture already ran initialize_db, so the marker is set and
+    # this row's stamp survives — simulate the pre-upgrade state by
+    # dropping the marker, then re-running the migration.
+    with sqlite3.connect(db) as conn:
+        conn.execute("DELETE FROM monitoring_migrations")
+    ms.initialize_db(db)
+
+    by_slug = {i.slug: i for i in ms.list_watchlist(db_path=db)}
+    assert by_slug["vendor-stripe"].baselined_at is None  # re-seeds
+    assert by_slug["acme-changelog"].baselined_at == stamp  # rss untouched
+
+    # Idempotent: a row baselined AFTER the migration is never reset again.
+    ms.record_baseline(vendor_id, datetime.fromisoformat(stamp), [], db_path=db)
+    ms.initialize_db(db)
+    assert ms.get_watchlist_item(vendor_id, db_path=db).baselined_at == stamp
 
 
 def test_record_baseline_is_a_compare_and_swap(db: Path) -> None:

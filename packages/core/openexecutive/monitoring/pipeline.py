@@ -52,7 +52,7 @@ from openexecutive.monitoring.models import (
     Signal,
     WatchlistItem,
 )
-from openexecutive.monitoring.sources import get_source_for_kind
+from openexecutive.monitoring.sources import Source, get_source_for_kind
 from openexecutive.monitoring.sources._http import strip_url_query
 from openexecutive.monitoring.sources.base import (
     collapse_whitespace,
@@ -488,6 +488,39 @@ def _lost_race(
     return _LostRace(cutoff)
 
 
+def _split_baseline_exempt(
+    src: Source, item: WatchlistItem, entries: list[Signal],
+) -> tuple[list[Signal], list[Signal]]:
+    """Split a seeding row's first-poll entries into (archive, exempt).
+
+    ``exempt`` is what the adapter's optional ``promote_on_baseline`` hook
+    claims is live news rather than back-catalogue (see
+    ``sources.base.Source``); ``archive`` is everything else and is
+    baselined exactly as before. An adapter without the hook exempts
+    nothing, which is the historical behaviour for ``rss`` / ``edgar``.
+
+    A hook that raises is treated as "not exempt" — the same fail-quiet
+    stance ``matches_trigger`` takes, and the safe one: a crashing hook
+    must not turn a first poll into a back-catalogue replay.
+    """
+    hook = getattr(src, "promote_on_baseline", None)
+    if hook is None:
+        return entries, []
+    archive: list[Signal] = []
+    exempt: list[Signal] = []
+    for signal in entries:
+        try:
+            is_exempt = bool(hook(signal, item))
+        except Exception:
+            logger.exception(
+                "monitoring.pipeline: promote_on_baseline crashed on %r — "
+                "treating as baseline", item.slug,
+            )
+            is_exempt = False
+        (exempt if is_exempt else archive).append(signal)
+    return archive, exempt
+
+
 def _record_baseline(
     item: WatchlistItem,
     entries: list[Signal],
@@ -654,17 +687,34 @@ async def _poll_one_watchlist_item(
     # baseline. ``item`` is the pre-poll snapshot, so the in-memory value
     # is unaffected by ``mark_polled``. Baseline rows never reach the
     # alert pipeline, so they are never charged to the scan budget.
+    #
+    # An adapter may exempt individual entries from its own baseline via
+    # the optional ``promote_on_baseline`` hook (see ``sources.base``):
+    # ``vendor_status`` uses it so an incident that is still OPEN when the
+    # watch is added surfaces on that first poll while the resolved
+    # archive is still swallowed. Exempt entries skip the baseline write
+    # and fall through to the ordinary cascade below.
     lost_race: _LostRace | None = None
     if (
         getattr(src, "seed_on_first_poll", False)
         and item.id is not None
         and item.baselined_at is None
     ):
-        recorded = _record_baseline(item, capped, fetched_at, db_path=db_path)
+        archive, exempt = _split_baseline_exempt(src, item, capped)
+        recorded = _record_baseline(item, archive, fetched_at, db_path=db_path)
         if recorded is not None:
-            tally.written = recorded
-            return
-        lost_race = _lost_race(item, fetched_at, db_path=db_path)
+            tally.written += recorded
+            if not exempt:
+                return
+            # The stamp is claimed and the archive is recorded, so this row
+            # is no longer seeding: the exempt entries run the ordinary
+            # cascade. Crash-safe in the direction that matters — dying
+            # here leaves them unrecorded, and the next tick (no longer a
+            # first poll) promotes them normally instead of replaying the
+            # archive.
+            capped = exempt
+        else:
+            lost_race = _lost_race(item, fetched_at, db_path=db_path)
 
     # Apply the per-item trigger filter (default: True). Entries that miss
     # it are dropped — unless this scan lost the baseline race, in which
