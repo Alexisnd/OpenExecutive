@@ -15,6 +15,14 @@ Watchlist row shape:
     — when present, only entries whose title OR summary contain at least
     one keyword surface. Otherwise every new entry surfaces.
 
+Freshness: each entry's ``<pubDate>`` / ``<updated>`` is parsed into
+``Signal.published_at`` so the pipeline can tell *when it happened* apart
+from *when we first saw it* (``captured_at``). Two guards follow from
+that (issue #80 — a January article was surfacing as September news):
+the first poll of a row records the feed's existing entries as a
+baseline without promoting them, and entries older than
+``EXTERNAL_MONITOR_MAX_SIGNAL_AGE_DAYS`` are recorded but never promoted.
+
 Severity hint defaults to ``LOW`` — RSS is by far the noisiest source,
 so a low default lets the watchlist's ``severity_floor`` filter
 aggressively. Operators expecting HIGH-severity feeds (e.g. SEC EDGAR
@@ -48,6 +56,7 @@ from openexecutive.monitoring.sources._http import (
     strip_url_query,
     validate_target_url,
 )
+from openexecutive.monitoring.sources.base import feed_entry_published_at
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +70,10 @@ class RssSource:
     # RSS publishers update less often than status pages — 30 min is the
     # sweet spot between freshness and politeness toward upstream.
     default_poll_interval_minutes: int = 30
+    # A feed returns its whole back-catalogue on every poll, so the first
+    # poll is a baseline (see Source.seed_on_first_poll) — otherwise every
+    # historical entry would fire as "news" the moment a watch is added.
+    seed_on_first_poll: bool = True
 
     async def poll(
         self, item: WatchlistItem, *, db_path: Path | None = None
@@ -124,6 +137,7 @@ class RssSource:
                 source_kind=self.kind,
                 source_external_id=entry_id[:500],
                 captured_at=datetime.now(UTC).isoformat(),
+                published_at=feed_entry_published_at(entry),
                 normalized_summary=summary[:500],
                 raw_payload={
                     "feed_label": feed_label,

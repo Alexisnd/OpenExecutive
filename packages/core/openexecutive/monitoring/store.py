@@ -95,6 +95,7 @@ def initialize_db(db_path: Path | None = None) -> None:
                 source_kind TEXT NOT NULL,
                 source_external_id TEXT NOT NULL,
                 captured_at TEXT NOT NULL,
+                published_at TEXT,
                 normalized_summary TEXT NOT NULL,
                 raw_payload_json TEXT NOT NULL DEFAULT '{}',
                 provenance_url TEXT NOT NULL,
@@ -130,6 +131,9 @@ def initialize_db(db_path: Path | None = None) -> None:
             conn, "external_signals", "enrichment_json",
             "TEXT NOT NULL DEFAULT '{}'",
         )
+        # Upstream publish timestamp (issue #80). Nullable: pre-existing rows
+        # and sources without an upstream timestamp carry NULL.
+        _ensure_column(conn, "external_signals", "published_at", "TEXT")
 
 
 def _ensure_column(
@@ -393,14 +397,15 @@ def insert_signal(signal: Signal, db_path: Path | None = None) -> int | None:
         cursor = conn.execute(
             "INSERT OR IGNORE INTO external_signals "
             "(watchlist_id, source_kind, source_external_id, captured_at, "
-            "normalized_summary, raw_payload_json, provenance_url, "
-            "severity_hint, dedup_key) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "published_at, normalized_summary, raw_payload_json, "
+            "provenance_url, severity_hint, dedup_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 signal.watchlist_id,
                 signal.source_kind,
                 signal.source_external_id,
                 signal.captured_at,
+                signal.published_at,
                 signal.normalized_summary,
                 json.dumps(signal.raw_payload),
                 signal.provenance_url,

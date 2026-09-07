@@ -49,7 +49,10 @@ function SignalRow({ signal }: { signal: WatchlistSignal }) {
             {signal.normalized_summary}
           </div>
           <div className="text-[11px] text-fg-muted mt-0.5">
-            {formatRelTime(signal.captured_at)} ago · severity {signal.severity_hint}
+            {signal.published_at
+              ? `published ${formatRelTime(signal.published_at)} ago · seen ${formatRelTime(signal.captured_at)} ago`
+              : `${formatRelTime(signal.captured_at)} ago`}
+            {" "}· severity {signal.severity_hint}
           </div>
         </div>
         <span

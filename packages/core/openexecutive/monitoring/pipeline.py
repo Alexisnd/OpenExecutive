@@ -42,9 +42,11 @@ from openexecutive.monitoring.models import (
     MODE_DRY_RUN,
     OUTCOME_ALERTED,
     OUTCOME_FAILED,
+    OUTCOME_SUPPRESSED_BASELINE,
     OUTCOME_SUPPRESSED_BELOW_FLOOR,
     OUTCOME_SUPPRESSED_DRY_RUN,
     OUTCOME_SUPPRESSED_LOW_RELEVANCE,
+    OUTCOME_SUPPRESSED_STALE,
     SOURCE_KIND_QUERY,
     Signal,
     WatchlistItem,
@@ -96,6 +98,35 @@ def _due_for_poll(item: WatchlistItem, now: datetime) -> bool:
         last = last.replace(tzinfo=UTC)
     floor = timedelta(minutes=_poll_floor_minutes_for(item.signal_type))
     return now - last >= floor
+
+
+# --------------------------------------------------------------------- #
+# Freshness gate
+# --------------------------------------------------------------------- #
+
+
+def _is_stale(signal: Signal, now: datetime, max_age_days: int) -> bool:
+    """True when the upstream publish time is older than the age gate.
+
+    Only signals that carry ``published_at`` can be judged; sources without
+    an upstream timestamp (stock, page_watch, query) always pass. An
+    unparseable timestamp also passes — the adapter writes ISO 8601, so a
+    bad value is a bug to surface downstream, not a reason to drop the
+    event silently. ``max_age_days <= 0`` disables the gate.
+    """
+    if max_age_days <= 0 or not signal.published_at:
+        return False
+    try:
+        published = datetime.fromisoformat(signal.published_at)
+    except ValueError:
+        logger.warning(
+            "monitoring.pipeline: unparseable published_at %r on %s — "
+            "treating as fresh", signal.published_at, signal.dedup_key,
+        )
+        return False
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=UTC)
+    return now - published > timedelta(days=max_age_days)
 
 
 # --------------------------------------------------------------------- #
@@ -187,6 +218,12 @@ def _signal_to_alert_event(
     # makes them robust to the model's tendency to skim long bodies.
     parts.append(f"Watchlist: {item.slug}")
     parts.append(f"Severity hint: {signal.severity_hint.value}")
+    # When it happened vs when we noticed it — distinct on purpose (issue
+    # #80). The age gate already drops clearly stale items before this
+    # point; these lines let triage weigh anything inside the window.
+    if signal.published_at:
+        parts.append(f"Published: {signal.published_at}")
+    parts.append(f"Discovered: {signal.captured_at}")
     target = signal.raw_payload.get("target_url")
     if target:
         parts.append(f"Source: {target}")
@@ -314,6 +351,15 @@ async def _poll_one_watchlist_item(
         )
         return 0
 
+    # First poll of this row → feed-listing sources are baselined (see
+    # Source.seed_on_first_poll). Read BEFORE the poll: ``mark_polled`` in
+    # the ``finally`` below flips the DB row, and ``item`` is the pre-poll
+    # snapshot. A failed first fetch still marks the row polled, so the
+    # next successful poll is NOT a baseline — the age gate below is the
+    # backstop for that case.
+    is_baseline_poll = item.last_polled_at is None and src.seed_on_first_poll
+    max_age_days = get_settings().external_monitor_max_signal_age_days
+
     try:
         emitted = await src.poll(item, db_path=db_path)
     except Exception:
@@ -382,6 +428,28 @@ async def _poll_one_watchlist_item(
         # paired external_signal_suppressed audit event so a reader can
         # tell from the audit log alone (without joining external_signals)
         # what was noticed but not surfaced.
+        #
+        # Freshness gates come first: a baseline entry or a stale one is
+        # "already happened" news regardless of mode / floor, and neither
+        # should spend an enrichment call.
+        if is_baseline_poll:
+            store.mark_signal_processed(
+                signal_id, OUTCOME_SUPPRESSED_BASELINE, db_path=db_path
+            )
+            _audit_suppressed(
+                signal_id, item, signal, OUTCOME_SUPPRESSED_BASELINE,
+            )
+            continue
+
+        if _is_stale(signal, now, max_age_days):
+            store.mark_signal_processed(
+                signal_id, OUTCOME_SUPPRESSED_STALE, db_path=db_path
+            )
+            _audit_suppressed(
+                signal_id, item, signal, OUTCOME_SUPPRESSED_STALE,
+            )
+            continue
+
         if item.mode == MODE_DRY_RUN:
             store.mark_signal_processed(
                 signal_id, OUTCOME_SUPPRESSED_DRY_RUN, db_path=db_path

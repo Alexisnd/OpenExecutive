@@ -10,7 +10,7 @@ pipeline orchestration code instead.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -25,8 +25,10 @@ from openexecutive.monitoring.models import (
     MODE_ACTIVE,
     MODE_DRY_RUN,
     OUTCOME_ALERTED,
+    OUTCOME_SUPPRESSED_BASELINE,
     OUTCOME_SUPPRESSED_BELOW_FLOOR,
     OUTCOME_SUPPRESSED_DRY_RUN,
+    OUTCOME_SUPPRESSED_STALE,
     Signal,
     WatchlistItem,
 )
@@ -57,10 +59,12 @@ class _FakeSource:
 
     kind: str = "vendor_status"  # reuse a registered kind for routing
     default_poll_interval_minutes: int = 5
+    seed_on_first_poll: bool = False
 
-    def __init__(self, signals: list[Signal]) -> None:
+    def __init__(self, signals: list[Signal], *, seed: bool = False) -> None:
         self._signals = signals
         self.calls = 0
+        self.seed_on_first_poll = seed
 
     async def poll(
         self, item: WatchlistItem, *, db_path: Path | None = None
@@ -84,8 +88,8 @@ def install_fake_source(monkeypatch: pytest.MonkeyPatch):
     original = SOURCE_REGISTRY.get("vendor_status")
     installed: list[_FakeSource] = []
 
-    def _set(signals: list[Signal]) -> _FakeSource:
-        fake = _FakeSource(signals)
+    def _set(signals: list[Signal], *, seed: bool = False) -> _FakeSource:
+        fake = _FakeSource(signals, seed=seed)
         SOURCE_REGISTRY["vendor_status"] = fake  # type: ignore[assignment]
         installed.append(fake)
         return fake
@@ -103,12 +107,14 @@ def _make_signal(
     dedup_key: str = "vendor_status:abc",
     severity: AlertSeverity = AlertSeverity.HIGH,
     summary: str = "Test incident",
+    published_at: str | None = None,
 ) -> Signal:
     return Signal(
         watchlist_id=0,  # set by _FakeSource at poll time
         source_kind="vendor_status",
         source_external_id="upstream-1",
         captured_at=datetime.now(UTC).isoformat(),
+        published_at=published_at,
         normalized_summary=summary,
         raw_payload={"source": "fake"},
         provenance_url="https://example.com/incident/1",
@@ -321,6 +327,221 @@ def test_dedup_key_collision_is_silent(
 
 
 # --------------------------------------------------------------------- #
+# Freshness gates (issue #80) — published_at vs captured_at
+# --------------------------------------------------------------------- #
+
+
+def _install_promotion_recorder(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    promoted: list[Any] = []
+    monkeypatch.setattr(
+        "openexecutive.monitoring.pipeline.schedule_evaluation",
+        lambda event: promoted.append(event),
+    )
+    return promoted
+
+
+def _iso_days_ago(days: float) -> str:
+    return (datetime.now(UTC) - timedelta(days=days)).isoformat()
+
+
+def test_stale_published_signal_is_recorded_but_not_promoted(
+    db: Path,
+    install_fake_source,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A January article fetched in September is not September news: a
+    signal whose upstream published_at is past the age gate lands in
+    external_signals (audit + dedup) with outcome suppressed_stale and
+    never reaches triage."""
+    promoted = _install_promotion_recorder(monkeypatch)
+    ms.insert_watchlist_item(
+        slug="acme-blog", signal_type="vendor_status",
+        target="https://example.com/feed", db_path=db,
+    )
+    install_fake_source([
+        _make_signal(dedup_key="vendor_status:old", published_at=_iso_days_ago(60)),
+    ])
+
+    written = asyncio.run(mp.run_external_monitor_scan(db_path=db))
+    assert written == 1
+    assert promoted == []
+    rows = ms.list_recent_signals(db_path=db)
+    assert len(rows) == 1
+    assert rows[0]["processed_outcome"] == OUTCOME_SUPPRESSED_STALE
+    assert rows[0]["published_at"] is not None
+    # Stale suppression is not a "fire" — trust stats must not move.
+    item = ms.list_watchlist(db_path=db)[0]
+    assert item.fired_count == 0
+
+
+def test_fresh_published_signal_promotes(
+    db: Path,
+    install_fake_source,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inside the age window the gate is transparent — same path as before."""
+    promoted = _install_promotion_recorder(monkeypatch)
+    ms.insert_watchlist_item(
+        slug="acme-blog", signal_type="vendor_status",
+        target="https://example.com/feed", db_path=db,
+    )
+    install_fake_source([
+        _make_signal(dedup_key="vendor_status:new", published_at=_iso_days_ago(1)),
+    ])
+
+    asyncio.run(mp.run_external_monitor_scan(db_path=db))
+    assert len(promoted) == 1
+    rows = ms.list_recent_signals(db_path=db)
+    assert rows[0]["processed_outcome"] == OUTCOME_ALERTED
+
+
+def test_age_gate_disabled_when_zero(
+    db: Path,
+    install_fake_source,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EXTERNAL_MONITOR_MAX_SIGNAL_AGE_DAYS=0 turns the gate off entirely."""
+    promoted = _install_promotion_recorder(monkeypatch)
+    from openexecutive.config import get_settings
+    base = get_settings()
+    monkeypatch.setattr(
+        "openexecutive.monitoring.pipeline.get_settings",
+        lambda: base.model_copy(update={"external_monitor_max_signal_age_days": 0}),
+    )
+    ms.insert_watchlist_item(
+        slug="acme-blog", signal_type="vendor_status",
+        target="https://example.com/feed", db_path=db,
+    )
+    install_fake_source([
+        _make_signal(dedup_key="vendor_status:old", published_at=_iso_days_ago(400)),
+    ])
+
+    asyncio.run(mp.run_external_monitor_scan(db_path=db))
+    assert len(promoted) == 1
+
+
+def test_undated_signal_passes_age_gate() -> None:
+    """Sources with no upstream timestamp (stock, page_watch, query) are
+    never judged stale; a malformed timestamp is treated as fresh too —
+    dropping an event on a parse bug would hide the bug."""
+    now = datetime.now(UTC)
+    assert mp._is_stale(_make_signal(), now, 7) is False
+    assert mp._is_stale(_make_signal(published_at="not-a-date"), now, 7) is False
+    assert mp._is_stale(_make_signal(published_at=_iso_days_ago(8)), now, 7) is True
+    assert mp._is_stale(_make_signal(published_at=_iso_days_ago(6)), now, 7) is False
+    # Naive timestamps are read as UTC rather than blowing up on comparison.
+    naive = (now - timedelta(days=30)).replace(tzinfo=None).isoformat()
+    assert mp._is_stale(_make_signal(published_at=naive), now, 7) is True
+
+
+def test_first_poll_baselines_seeding_source(
+    db: Path,
+    install_fake_source,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A feed-listing source (rss / edgar) returns its whole back-catalogue
+    on every poll. The first poll of a new watch must record those entries
+    as seen without promoting any of them; only entries that appear on a
+    later poll fire."""
+    promoted = _install_promotion_recorder(monkeypatch)
+    ms.insert_watchlist_item(
+        slug="acme-changelog", signal_type="vendor_status",
+        target="https://example.com/feed", db_path=db,
+    )
+    fake = install_fake_source(
+        [
+            _make_signal(dedup_key="vendor_status:e1", published_at=_iso_days_ago(1)),
+            _make_signal(dedup_key="vendor_status:e2"),  # undated
+        ],
+        seed=True,
+    )
+
+    # Tick 1 — baseline: both recorded, nothing promoted, nothing "fired".
+    written = asyncio.run(mp.run_external_monitor_scan(db_path=db))
+    assert written == 2
+    assert promoted == []
+    outcomes = {r["dedup_key"]: r["processed_outcome"] for r in ms.list_recent_signals(db_path=db)}
+    assert outcomes == {
+        "vendor_status:e1": OUTCOME_SUPPRESSED_BASELINE,
+        "vendor_status:e2": OUTCOME_SUPPRESSED_BASELINE,
+    }
+    item = ms.list_watchlist(db_path=db)[0]
+    assert item.fired_count == 0
+    assert item.last_polled_at is not None
+
+    # Tick 2 — a genuinely new entry appears alongside the old ones.
+    fake._signals.append(
+        _make_signal(dedup_key="vendor_status:e3", published_at=_iso_days_ago(0.1)),
+    )
+    ms.mark_polled(item.id or 0, datetime(2000, 1, 1, tzinfo=UTC), db_path=db)
+    asyncio.run(mp.run_external_monitor_scan(db_path=db))
+    assert [e.external_id for e in promoted] == ["vendor_status:e3"]
+    outcomes = {r["dedup_key"]: r["processed_outcome"] for r in ms.list_recent_signals(db_path=db)}
+    assert outcomes["vendor_status:e3"] == OUTCOME_ALERTED
+    assert outcomes["vendor_status:e1"] == OUTCOME_SUPPRESSED_BASELINE  # untouched
+
+
+def test_non_seeding_source_promotes_on_first_poll(
+    db: Path,
+    install_fake_source,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Point-in-time sources (stock threshold, open vendor incident) are
+    actionable on the very first poll — no baseline for them."""
+    promoted = _install_promotion_recorder(monkeypatch)
+    ms.insert_watchlist_item(
+        slug="vendor-stripe", signal_type="vendor_status",
+        target="https://example.com/feed", db_path=db,
+    )
+    install_fake_source([_make_signal(dedup_key="vendor_status:open")], seed=False)
+    asyncio.run(mp.run_external_monitor_scan(db_path=db))
+    assert len(promoted) == 1
+
+
+def test_published_at_column_added_to_existing_db(tmp_path: Path) -> None:
+    """DBs created before published_at existed get the column via the
+    idempotent additive ALTER, and the value round-trips on insert/read."""
+    import sqlite3
+
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+            CREATE TABLE external_signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                watchlist_id INTEGER NOT NULL,
+                source_kind TEXT NOT NULL,
+                source_external_id TEXT NOT NULL,
+                captured_at TEXT NOT NULL,
+                normalized_summary TEXT NOT NULL,
+                raw_payload_json TEXT NOT NULL DEFAULT '{}',
+                provenance_url TEXT NOT NULL,
+                severity_hint TEXT NOT NULL DEFAULT 'low',
+                dedup_key TEXT NOT NULL UNIQUE,
+                processed_at TEXT,
+                processed_outcome TEXT,
+                promoted_alert_id INTEGER,
+                enrichment_json TEXT NOT NULL DEFAULT '{}'
+            );
+        """)
+    ms.initialize_db(db_path)
+    ms.initialize_db(db_path)  # idempotent — second run must not fail
+    with sqlite3.connect(db_path) as conn:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(external_signals)")}
+    assert "published_at" in cols
+
+    sig = _make_signal(published_at="2026-01-15T08:00:00+00:00")
+    sig = sig.model_copy(update={"watchlist_id": 1})
+    assert ms.insert_signal(sig, db_path=db_path) is not None
+    rows = ms.list_recent_signals(db_path=db_path)
+    assert rows[0]["published_at"] == "2026-01-15T08:00:00+00:00"
+    # Rows written before the column existed read back as None, not "".
+    undated = _make_signal(dedup_key="vendor_status:legacy").model_copy(update={"watchlist_id": 1})
+    ms.insert_signal(undated, db_path=db_path)
+    by_key = {r["dedup_key"]: r for r in ms.list_recent_signals(db_path=db_path)}
+    assert by_key["vendor_status:legacy"]["published_at"] is None
+
+
+# --------------------------------------------------------------------- #
 # Heartbeat lifecycle
 # --------------------------------------------------------------------- #
 
@@ -480,6 +701,14 @@ def test_signal_to_alert_event_carries_slug_and_severity_for_triage() -> None:
     assert "Provenance: https://finance.yahoo.com/quote/AAPL" in event.body
     assert event.source == "stock"
     assert event.external_id == "stock:abc123"
+    # No upstream timestamp → no Published line, but Discovered is always there.
+    assert "Published:" not in event.body
+    assert "Discovered: 2026-05-28T12:00:00+00:00" in event.body
+
+    dated = signal.model_copy(update={"published_at": "2026-01-15T08:00:00+00:00"})
+    body = _signal_to_alert_event(dated, item).body
+    assert "Published: 2026-01-15T08:00:00+00:00" in body
+    assert "Discovered: 2026-05-28T12:00:00+00:00" in body
 
 
 def test_strip_url_query_drops_tokens() -> None:

@@ -108,6 +108,10 @@ async def test_edgar_emits_signal_per_matching_filing(
     assert by_form["8-K"].provenance_url.endswith("-index.htm")
     assert by_form["8-K"].normalized_summary.startswith("[Apple] 8-K filed 2026-05-28")
     assert all(s.dedup_key.startswith("edgar:") for s in signals)
+    # <updated>2026-05-28T16:30:00-04:00</updated> → published_at in UTC, so
+    # the pipeline's age gate judges the filing date, not the poll time.
+    assert by_form["8-K"].published_at == "2026-05-28T20:30:00+00:00"
+    assert by_form["8-K"].captured_at != by_form["8-K"].published_at
 
     # The ticker target reaches the EDGAR URL; the configured UA is sent.
     from openexecutive.config import get_settings
@@ -259,6 +263,11 @@ def test_severity_for_form() -> None:
     assert _severity_for_form("10-K") == AlertSeverity.MEDIUM
     assert _severity_for_form("10-Q") == AlertSeverity.MEDIUM
     assert _severity_for_form("4") == AlertSeverity.LOW
+
+
+def test_edgar_is_a_seeding_source() -> None:
+    """The Atom feed lists past filings on every poll — first poll must baseline."""
+    assert EdgarSource.seed_on_first_poll is True
 
 
 def test_edgar_registered() -> None:

@@ -51,6 +51,7 @@ from openexecutive.monitoring.sources._http import (
     fetch_bounded,
     validate_target_url,
 )
+from openexecutive.monitoring.sources.base import feed_entry_published_at
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,9 @@ _IDENT_RE = re.compile(rf"^[A-Za-z0-9.\-]{{1,{_MAX_IDENT_LEN}}}$")
 class EdgarSource:
     kind: str = SOURCE_KIND_EDGAR
     default_poll_interval_minutes: int = _DEFAULT_POLL_MINUTES
+    # The Atom feed lists the last N filings on every poll; the first poll
+    # is a baseline so a new watch doesn't replay past filings as news.
+    seed_on_first_poll: bool = True
 
     async def poll(
         self, item: WatchlistItem, *, db_path: Path | None = None
@@ -228,6 +232,7 @@ def _entry_to_signal(
         source_kind=SOURCE_KIND_EDGAR,
         source_external_id=accession[:500],
         captured_at=datetime.now(UTC).isoformat(),
+        published_at=feed_entry_published_at(entry),
         normalized_summary=summary[:500],
         raw_payload={
             "label": label,

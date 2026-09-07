@@ -69,6 +69,8 @@ _MAX_ENTRIES_PER_FEED = 100
 class VendorStatusSource:
     kind: str = SOURCE_KIND_VENDOR_STATUS
     default_poll_interval_minutes: int = 5
+    # Open incidents on a vendor we just started watching are actionable now.
+    seed_on_first_poll: bool = False
 
     async def poll(
         self, item: WatchlistItem, *, db_path: Path | None = None

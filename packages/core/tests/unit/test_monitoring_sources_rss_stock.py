@@ -96,6 +96,45 @@ async def test_rss_emits_signals_for_each_entry(
     assert signals[0].severity_hint == AlertSeverity.LOW
     assert signals[0].dedup_key.startswith("rss:")
     assert signals[0].dedup_key != signals[1].dedup_key
+    # <pubDate> lands on published_at as ISO 8601 UTC — distinct from
+    # captured_at (issue #80: when it happened vs when we first saw it).
+    assert signals[0].published_at == "2026-05-28T12:00:00+00:00"
+    assert signals[1].published_at == "2026-05-27T09:00:00+00:00"
+    assert signals[0].captured_at != signals[0].published_at
+
+
+@pytest.mark.asyncio
+async def test_rss_entry_without_date_has_no_published_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A feed item with no <pubDate>/<updated> can't be aged — published_at
+    stays None so the pipeline's age gate passes it through (the first-poll
+    baseline is the only replay guard for such feeds)."""
+    undated = _SAMPLE_RSS.replace(
+        b"<pubDate>Wed, 28 May 2026 12:00:00 GMT</pubDate>", b""
+    )
+
+    async def fake_fetch(url: str, max_bytes: int) -> bytes:
+        return undated
+
+    monkeypatch.setattr(
+        "openexecutive.monitoring.sources.rss.fetch_bounded", fake_fetch
+    )
+    monkeypatch.setattr(
+        "openexecutive.monitoring.sources.rss.validate_target_url",
+        lambda u: (True, ""),
+    )
+
+    signals = await RssSource().poll(_make_item())
+    assert len(signals) == 2
+    assert signals[0].published_at is None
+    assert signals[1].published_at == "2026-05-27T09:00:00+00:00"
+
+
+def test_rss_is_a_seeding_source() -> None:
+    """A feed returns its back-catalogue on every poll, so the first poll of a
+    row must be a baseline (see Source.seed_on_first_poll)."""
+    assert RssSource.seed_on_first_poll is True
 
 
 def test_rss_matches_trigger_keywords() -> None:

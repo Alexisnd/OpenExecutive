@@ -22,8 +22,11 @@ Invariants every adapter MUST uphold:
 """
 from __future__ import annotations
 
+import calendar
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from openexecutive.monitoring.models import Signal, WatchlistItem
 
@@ -34,6 +37,13 @@ class Source(Protocol):
     kind: str  # matches WatchlistItem.signal_type
 
     default_poll_interval_minutes: int
+    # True for feed-listing sources (rss, edgar) whose poll returns the
+    # feed's whole back-catalogue, not just what changed: on the FIRST poll
+    # of a row the pipeline records every entry as seen (outcome
+    # ``suppressed_baseline``) and promotes nothing, so the watch reports
+    # what changes from now on. False for point-in-time sources (stock,
+    # query) and for page_watch, which keeps its own baseline.
+    seed_on_first_poll: bool
 
     async def poll(
         self, item: WatchlistItem, *, db_path: Path | None = None
@@ -64,3 +74,26 @@ class Source(Protocol):
 
 # Re-export Signal so adapter code can ``from .base import Signal``.
 __all__ = ["Signal", "Source"]
+
+
+def feed_entry_published_at(entry: Mapping[str, Any]) -> str | None:
+    """ISO 8601 UTC publish timestamp of a feedparser entry, or None.
+
+    feedparser normalises ``<pubDate>`` / ``<published>`` / ``<updated>``
+    into ``*_parsed`` ``time.struct_time`` values already converted to
+    UTC; we prefer ``published`` (when the item first appeared) over
+    ``updated`` (last edit). Entries with no parseable date return None —
+    the pipeline's age gate then can't judge them, and only the first-poll
+    baseline protects against replaying them as new.
+    """
+    for key in ("published_parsed", "updated_parsed"):
+        st = entry.get(key)
+        if not st:
+            continue
+        try:
+            # struct_time is already UTC (feedparser normalises), so timegm —
+            # never mktime, which would apply the host's local offset.
+            return datetime.fromtimestamp(calendar.timegm(st), tz=UTC).isoformat()
+        except (TypeError, ValueError, OverflowError, OSError):
+            continue
+    return None

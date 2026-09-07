@@ -1233,12 +1233,32 @@ external_monitoring:
       is intentional — the briefing layer can answer "what did you ignore
       overnight" and the trust loop has a denominator for hit-rate metrics.
       Columns: id, watchlist_id, source_kind, source_external_id,
-      captured_at, normalized_summary, raw_payload_json, provenance_url,
-      severity_hint, dedup_key, processed_at, processed_outcome
-      ('alerted' | 'suppressed_dry_run' | 'suppressed_below_floor' |
+      captured_at, published_at, normalized_summary, raw_payload_json,
+      provenance_url, severity_hint, dedup_key, processed_at,
+      processed_outcome
+      ('alerted' | 'suppressed_baseline' | 'suppressed_stale' |
+      'suppressed_dry_run' | 'suppressed_below_floor' |
       'suppressed_dup' | 'suppressed_triage' | 'suppressed_low_relevance' |
       'failed'),
       promoted_alert_id, enrichment_json.
+      captured_at is when the monitor first saw the event; published_at
+      (nullable, added via the same idempotent additive ALTER pattern) is
+      when the upstream says it happened — RSS <pubDate>/<updated>, EDGAR
+      filing date; NULL for stock / page_watch / query. The two are never
+      conflated (issue #80). Two freshness gates run FIRST in the
+      suppression cascade, before dry_run / floor / enrichment, so they
+      never spend an LLM call: (1) `suppressed_baseline` — on the FIRST
+      poll of a row (last_polled_at IS NULL) whose adapter declares
+      `seed_on_first_poll` (rss, edgar), every entry in the feed is
+      recorded as seen and nothing is promoted, so a new watch reports
+      what changes from now on rather than replaying the feed's
+      back-catalogue (mirrors page_watch's first-observation baseline);
+      (2) `suppressed_stale` — a signal whose published_at is older than
+      EXTERNAL_MONITOR_MAX_SIGNAL_AGE_DAYS (default 7; 0 disables) at
+      capture time is recorded but never promoted. The alert body handed
+      to triage carries `Published:` (when known) and `Discovered:`
+      lines so anything inside the window is still judged on when it
+      happened, not when it was found.
       enrichment_json holds the capture-time relevance read
       (relevance_score 0..1, why_it_matters, matched_initiative) written by
       the enrichment stage; '{}' when enrichment is off or missed. Added via
@@ -1270,10 +1290,10 @@ external_monitoring:
       add a top-level fact in this YAML when they ship.
     shipped:
       - "vendor_status — polls Statuspage Atom history feeds (AWS, Stripe, Twilio, GitHub, Cloudflare, …) and emits one Signal per incident entry. Severity hint HIGH by default. Optional `trigger_json.keywords` narrows to entries whose title contains a keyword."
-      - "rss — generic Atom/RSS feed adapter via feedparser; handles competitor changelogs, layoffs.fyi, USPTO patent feeds, regulatory filings, blog RSS. Severity hint LOW by default (most RSS is noisy). Optional `trigger_json.keywords` filters by title + summary."
+      - "rss — generic Atom/RSS feed adapter via feedparser; handles competitor changelogs, layoffs.fyi, USPTO patent feeds, regulatory filings, blog RSS. Severity hint LOW by default (most RSS is noisy). Optional `trigger_json.keywords` filters by title + summary. Each entry's <pubDate>/<updated> is parsed into Signal.published_at; declares `seed_on_first_poll` so a new watch baselines the feed's existing entries instead of firing them, and entries older than EXTERNAL_MONITOR_MAX_SIGNAL_AGE_DAYS are recorded as `suppressed_stale` (issue #80)."
       - "stock — Yahoo Finance Chart endpoint (the same endpoint yfinance scrapes, used directly via httpx to avoid pandas/numpy). Watchlist `target` is the ticker; signals fire when |intraday vs previous close| ≥ `trigger.abs_change_pct_gte` (default 5%). Severity hint scales with the magnitude of the move (≥10% URGENT, ≥5% HIGH, ≥2% MEDIUM, else LOW). v2 candidate: swap behind the same Source interface for a paid Alpha Vantage / Finnhub feed if Yahoo brittleness bites."
       - "query — standing web-search query. Watchlist `target` is a natural-language query (e.g. 'Acme Corp layoffs OR restructuring OR funding'); each poll runs it through `BaseAgent.analyze_with_tools` with the web_search tool (model pinned to `get_research_model()`, honouring an OpenRouter Council override — the provider layer translates native web_search into OpenRouter's `plugins:[{id:web}]`, see providers/translator). The model reports distinct results via the `emit_query_results` tool; each result with a valid clickable URL becomes a Signal (the adapter emits a flat severity hint LOW because it can't judge materiality per-hit — the pipeline regrades this from the capture-time relevance read BEFORE the floor gate via `_grade_query_severity`, so a material hit clears a medium/high floor instead of being suppressed; dedup key `query:` + first 32 hex chars of sha256(slug + NUL + canonical_url); URL-less results dropped to uphold the provenance invariant). UNLIKE the keyless feed adapters this source is BILLED (one LLM call + web searches per poll), so it polls slowly (default 360 min), is bounded by `web_search_max_uses` + per-row `config.max_results` (default 5, ceiling 10), and has its own kill switch `EXTERNAL_MONITOR_QUERY_ENABLED`. Optional `trigger.keywords` filters like rss; `config.allowed_domains`/`blocked_domains` are best-effort prompt hints only (NOT enforced, and not honoured by the OpenRouter web plugin). This is the 'watch arbitrary conditions' primitive that no feed publishes."
-      - "edgar — SEC EDGAR filings. Watchlist `target` is a ticker (e.g. 'AAPL') or CIK; polls SEC's browse-edgar Atom feed (`/cgi-bin/browse-edgar?action=getcompany&CIK=…&output=atom`, whose CIK param resolves a ticker server-side, so no ticker→CIK table is shipped), parsed with feedparser. Emits one Signal per new filing whose form is in the filter (`trigger.forms`, default {8-K, 10-K, 10-Q}; amendments like 8-K/A match their base form). Dedup on the filing's accession number (globally unique — the cleanest natural key of any source). Provenance is the filing-index URL. Severity hint: 8-K HIGH (material-event report), 10-K/10-Q MEDIUM, else LOW. Keyless, but SEC's fair-access policy requires a descriptive User-Agent with a contact — sent via the EDGAR_USER_AGENT setting (operators should override the default with a real contact). Reuses fetch_bounded (now with a per-call user_agent override), validate_target_url, and the standard dedup/Signal pattern."
+      - "edgar — SEC EDGAR filings. Watchlist `target` is a ticker (e.g. 'AAPL') or CIK; polls SEC's browse-edgar Atom feed (`/cgi-bin/browse-edgar?action=getcompany&CIK=…&output=atom`, whose CIK param resolves a ticker server-side, so no ticker→CIK table is shipped), parsed with feedparser. Emits one Signal per new filing whose form is in the filter (`trigger.forms`, default {8-K, 10-K, 10-Q}; amendments like 8-K/A match their base form). Dedup on the filing's accession number (globally unique — the cleanest natural key of any source). Provenance is the filing-index URL. Severity hint: 8-K HIGH (material-event report), 10-K/10-Q MEDIUM, else LOW. Keyless, but SEC's fair-access policy requires a descriptive User-Agent with a contact — sent via the EDGAR_USER_AGENT setting (operators should override the default with a real contact). Reuses fetch_bounded (now with a per-call user_agent override), validate_target_url, and the standard dedup/Signal pattern. The entry's <updated> lands on Signal.published_at and the adapter declares `seed_on_first_poll`, so a new watch baselines past filings instead of replaying them and filings older than EXTERNAL_MONITOR_MAX_SIGNAL_AGE_DAYS are `suppressed_stale`."
       - "page_watch — generic web-page change detection for feed-less pages (pricing, careers, leadership, ToS). Watchlist `target` is the page URL. STATEFUL (the first stateful adapter): each poll fetches the page (bounded, SSRF-guarded), reduces it to normalized visible text (drops script/style/comments/tags, unescapes entities, collapses whitespace — so markup/layout churn doesn't register), hashes the FULL normalized text (so a change anywhere registers — no length blind spot), and compares to the last-seen hash in `page_watch_state`. First observation stores a baseline and emits NOTHING; an unchanged page emits nothing; a changed page emits ONE Signal carrying a difflib-based change summary (~N% differs + the added text; the diff/snapshot are length-capped but detection is not) and updates the baseline. Severity hint LOW (page diffs are noisy — enrichment + severity_floor filter). Dedup key folds slug + UTC date + content hash (mirrors stock — a state seen again on a later day re-alerts; same-day repeats dedup). Optional `trigger.keywords` only surfaces a change when the change itself (summary + added text) matches. Reads/writes its state via the db_path threaded through Source.poll. Optional `config.fetch = \"xcrawl\"` routes the fetch through xcrawl's scrape API (clean markdown) instead of the keyless httpx fetcher — so JS-rendered / bot-blocked feed-less pages (most modern news/marketing sites) are monitorable; off by default, a no-op when xcrawl is disabled, and the scraped markdown is size-capped to mirror the httpx byte cap."
   insert_validation: |
     monitoring.target_validation.validate_and_normalize_target — runs at

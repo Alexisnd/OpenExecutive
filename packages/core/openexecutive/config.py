@@ -624,6 +624,16 @@ class Settings(BaseSettings):
     external_monitor_max_signals_per_scan: int = Field(
         50, alias="EXTERNAL_MONITOR_MAX_SIGNALS_PER_SCAN"
     )
+    # Freshness gate for sources that carry an upstream publish timestamp
+    # (rss <pubDate>, edgar filing date). A signal whose ``published_at`` is
+    # older than this many days at capture time is recorded but never
+    # promoted (outcome ``suppressed_stale``) — a feed that resurfaces a
+    # January article in September must not become September news (issue
+    # #80). 0 disables the gate. Sources without an upstream timestamp
+    # (stock, page_watch, query) are unaffected.
+    external_monitor_max_signal_age_days: int = Field(
+        7, alias="EXTERNAL_MONITOR_MAX_SIGNAL_AGE_DAYS"
+    )
     # Adapter-fetch ceiling (bytes). Caps the body we read from any single
     # external feed — defence against runaway sources (e.g. malformed RSS
     # that streams forever) and a soft guard against XML-bomb shapes.
