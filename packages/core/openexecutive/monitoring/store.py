@@ -33,6 +33,7 @@ from openexecutive.alerts.models import AlertSeverity
 from openexecutive.memory.episodic import DB_PATH, _resolve_db_path
 from openexecutive.monitoring.models import (
     MODE_ACTIVE,
+    OUTCOME_SUPPRESSED_BASELINE,
     Signal,
     WatchlistItem,
     is_valid_mode,
@@ -140,21 +141,33 @@ def initialize_db(db_path: Path | None = None) -> None:
         # crash between the two would leave the column present (so the
         # backfill never re-runs) but every already-polled row un-
         # baselined — and the next tick would swallow their new entries.
-        conn.execute("BEGIN")
-        try:
-            if _ensure_column(conn, "watchlist", "baselined_at", "TEXT"):
-                # Rows polled before this column existed have already
-                # surfaced whatever their feed held; treat them as
-                # baselined so the upgrade tick doesn't swallow genuinely
-                # new entries.
-                conn.execute(
-                    "UPDATE watchlist SET baselined_at = last_polled_at "
-                    "WHERE baselined_at IS NULL AND last_polled_at IS NOT NULL"
-                )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+        # Only open a write transaction when there is actually something to
+        # migrate: the steady-state boot must not contend for the write lock
+        # on the shared episodic_memory.db (a 5s busy timeout would abort
+        # startup). IMMEDIATE takes the lock up front, so the PRAGMA re-check
+        # inside _ensure_column sees a settled schema even if another
+        # initializer raced us to the ALTER.
+        if not _has_column(conn, "watchlist", "baselined_at"):
+            _migrate_baselined_at(conn)
+        # Add future migrations BELOW, not inside the guard above.
+
+
+def _migrate_baselined_at(conn: sqlite3.Connection) -> None:
+    """Add ``watchlist.baselined_at`` and backfill it, atomically."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if _ensure_column(conn, "watchlist", "baselined_at", "TEXT"):
+            # Rows polled before this column existed have already surfaced
+            # whatever their feed held; treat them as baselined so the
+            # upgrade tick doesn't swallow genuinely new entries.
+            conn.execute(
+                "UPDATE watchlist SET baselined_at = last_polled_at "
+                "WHERE baselined_at IS NULL AND last_polled_at IS NOT NULL"
+            )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def _ensure_column(
@@ -168,11 +181,23 @@ def _ensure_column(
     Table + column names are internal constants (never user input), so the
     f-string interpolation here carries no injection surface.
     """
-    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-    if column in cols:
+    if _has_column(conn, table, column):
         return False
-    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    except sqlite3.OperationalError as exc:
+        # Another initializer (a CLI run, an overlapping deploy) added the
+        # column between our PRAGMA check and the ALTER. That's the same
+        # end state as "already present" — and it must not abort boot.
+        if "duplicate column" in str(exc).lower():
+            return False
+        raise
     return True
+
+
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    return column in cols
 
 
 # --------------------------------------------------------------------- #
@@ -310,23 +335,6 @@ def mark_polled(
         )
 
 
-def mark_baselined(
-    item_id: int,
-    at: datetime,
-    db_path: Path | None = None,
-) -> None:
-    """Record that a seeding source's back-catalogue has been captured.
-
-    Called once, after the first poll that returned entries; from then on
-    the pipeline promotes new entries instead of baselining them.
-    """
-    with _get_conn(db_path) as conn:
-        conn.execute(
-            "UPDATE watchlist SET baselined_at = ? WHERE id = ?",
-            (at.isoformat(), item_id),
-        )
-
-
 def mark_fired(
     item_id: int,
     at: datetime,
@@ -437,28 +445,80 @@ def insert_signal(signal: Signal, db_path: Path | None = None) -> int | None:
     (see ``alerts/store.py:insert_alert``).
     """
     with _get_conn(db_path) as conn:
-        cursor = conn.execute(
-            "INSERT OR IGNORE INTO external_signals "
-            "(watchlist_id, source_kind, source_external_id, captured_at, "
-            "published_at, normalized_summary, raw_payload_json, "
-            "provenance_url, severity_hint, dedup_key) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                signal.watchlist_id,
-                signal.source_kind,
-                signal.source_external_id,
-                signal.captured_at,
-                signal.published_at,
-                signal.normalized_summary,
-                json.dumps(signal.raw_payload),
-                signal.provenance_url,
-                signal.severity_hint.value,
-                signal.dedup_key,
-            ),
-        )
-        if cursor.rowcount == 0:
-            return None
-        return int(cursor.lastrowid or 0)
+        return _insert_signal_row(conn, signal)
+
+
+def _insert_signal_row(conn: sqlite3.Connection, signal: Signal) -> int | None:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO external_signals "
+        "(watchlist_id, source_kind, source_external_id, captured_at, "
+        "published_at, normalized_summary, raw_payload_json, "
+        "provenance_url, severity_hint, dedup_key) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            signal.watchlist_id,
+            signal.source_kind,
+            signal.source_external_id,
+            signal.captured_at,
+            signal.published_at,
+            signal.normalized_summary,
+            json.dumps(signal.raw_payload),
+            signal.provenance_url,
+            signal.severity_hint.value,
+            signal.dedup_key,
+        ),
+    )
+    if cursor.rowcount == 0:
+        return None
+    return int(cursor.lastrowid or 0)
+
+
+def record_baseline(
+    item_id: int,
+    at: datetime,
+    signals: list[Signal],
+    db_path: Path | None = None,
+) -> list[tuple[int, Signal]] | None:
+    """Atomically claim a seeding row's baseline and record its back-catalogue.
+
+    One ``BEGIN IMMEDIATE`` transaction: a compare-and-swap on
+    ``baselined_at IS NULL`` stamps the row, then every signal is inserted
+    (``INSERT OR IGNORE`` on ``dedup_key``) and marked
+    ``suppressed_baseline``. Returns the ``(signal_id, signal)`` pairs that
+    were newly recorded, or ``None`` when another scan already holds the
+    stamp — in which case nothing was written and the caller takes the
+    lost-race path. All-or-nothing: a failure part-way rolls the stamp
+    back with the rows, so the next tick baselines the whole feed again
+    instead of replaying an unrecorded tail as news.
+    """
+    with _get_conn(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            claimed = conn.execute(
+                "UPDATE watchlist SET baselined_at = ? "
+                "WHERE id = ? AND baselined_at IS NULL",
+                (at.isoformat(), item_id),
+            )
+            if claimed.rowcount == 0:
+                conn.execute("ROLLBACK")
+                return None
+            recorded: list[tuple[int, Signal]] = []
+            processed_at = datetime.now(UTC).isoformat()
+            for signal in signals:
+                signal_id = _insert_signal_row(conn, signal)
+                if signal_id is None:
+                    continue
+                conn.execute(
+                    "UPDATE external_signals "
+                    "SET processed_at = ?, processed_outcome = ? WHERE id = ?",
+                    (processed_at, OUTCOME_SUPPRESSED_BASELINE, signal_id),
+                )
+                recorded.append((signal_id, signal))
+            conn.execute("COMMIT")
+            return recorded
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
 
 def mark_signal_processed(

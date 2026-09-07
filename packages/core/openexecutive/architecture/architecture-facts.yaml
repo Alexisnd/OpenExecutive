@@ -1184,8 +1184,9 @@ audit:
     - committee_review — one row per committee-reviewed turn; carries draft length, final length, per-reviewer critiques and timings (previously emitted but newly declared as a recognised event_type)
     - peer_memory — one row per `openexecutive.memory.honcho_client` call (prefetch / sync_turn / directional_chat / prefetch_department / sync_department_turn / append_department_note); carries `op`, `person_id`, optional `department_slug`, `outcome` (ok / timeout / error / disabled / no_person / no_department / no_loop / empty), `duration_ms`, plus op-specific details (query preview, reasoning_level, peer count, co_present_person_ids, co_present_department_slugs, originating_person_id, target_person_id, session_id, kind) so the flow-chart view renders the peer_memory path alongside `<retrieved_context>` and `<past_decisions>`. Disabled / no-Person / no-Department turns still emit (outcome marker) so audit absence equals "code path never ran" instead of "the provider was down."
     - external_signal_received — one row per signal an external-monitor adapter wrote to `external_signals`. Carries `signal_id`, `watchlist_id`, `watchlist_slug`, `source_kind`, `severity_hint`, `dedup_key`. The audit trail of what the monitor noticed, separate from what it surfaced.
+    - external_signal_deferred — one row per poll that skipped entries whose published_at is more than the row's future-skew tolerance ahead (aggregated — `count`, `future_skew_hours`, `race_tick`, and up to 10 `entries` each with `dedup_key`, `published_at`, `summary` and `provenance_url`, so an operator can tell WHAT was held back). Emitted from the scan loop's finally, so it survives a poll that raises later in the same row. A deferred entry is by design NOT written to external_signals (that would burn its dedup key and mute it for good), so this row is its only trace until its date passes and it is judged normally.
     - external_signal_promoted — one row per signal promoted into the alerts pipeline (post-suppression cascade). Carries `signal_id`, `watchlist_id`, `watchlist_slug`, `source_kind`, `severity_hint`, `dedup_key`, `provenance_url`. Pair with `external_signal_received` to compute promotion rate per watchlist row.
-    - external_monitor_poll — one row per watchlist row polled in a scan tick. Carries `watchlist_id`, `watchlist_slug`, `signal_type`, `signals_emitted`, `duration_ms`. Enables per-source health drill-down (`GET /audit?event_type=external_monitor_poll`) without needing a dedicated debug endpoint.
+    - external_monitor_poll — one row per watchlist row polled in a scan tick, emitted even when the row's poll raised or was cancelled (`failed` set to true, with `signals_emitted` still counting rows that landed before the failure, so the audit log stands on its own); `failed` is also true when the adapter crashed or no adapter is registered. A row with no registered adapter is still marked polled so it honours the cadence rather than re-firing every heartbeat. Carries `watchlist_id`, `watchlist_slug`, `signal_type`, `signals_emitted`, `duration_ms`, `failed`. Enables per-source health drill-down (`GET /audit?event_type=external_monitor_poll`) without needing a dedicated debug endpoint.
     - watchlist_research_periodic_ran — emitted by the periodic cron whenever the workflow actually fires. Carries `state_hash` (the input fingerprint at run time), `trigger` (`cold_start`, `state_changed`, or `staleness_floor`), `findings` count, `tool_calls` count, `ok_tool_calls`, `run_id`. The next tick reads the most recent row to decide skip-or-run (its `state_hash` for the fingerprint compare, its `ts` for the staleness floor). These three research run-history rows are the ONLY audit_log rows a fixture load/unload clears (via `monitoring.research.scheduler.clear_research_run_history`, called from `cli.fixture_loader._apply_state_from_source`): load wipes the profile/initiatives/watchlist that feed the fingerprint but otherwise preserves audit_log, so without this reset a same-fixture reload within the staleness floor would make the freshly-seeded scan skip itself and surface zero findings. A full reset still wipes all of audit_log.
     - watchlist_research_periodic_skipped — emitted when the state_hash matches the last `_ran` row. Carries `state_hash`. Visible cost-saving signal in the audit log.
     - watchlist_research_periodic_failed — emitted on workflow timeout / crash. Carries `state_hash` + `error` or `reason`.
@@ -1254,8 +1255,25 @@ external_monitoring:
       never spend an LLM call: (1) `suppressed_baseline` — on the first
       poll that RETURNS ENTRIES for a row whose adapter declares
       `seed_on_first_poll` (rss, edgar) and whose `baselined_at` is NULL,
-      every entry in the feed is recorded as seen, nothing is promoted,
-      and `baselined_at` is set — so a new watch reports what changes
+      every entry in the feed is recorded as seen and nothing is promoted.
+      The claim and the recording are ONE transaction
+      (store.record_baseline, BEGIN IMMEDIATE): a compare-and-swap on
+      `baselined_at IS NULL` stamps the row, then EVERY fetched entry —
+      trigger misses included, so the first entry that ever matches a
+      keyword is news rather than "back-catalogue", and widening a
+      trigger later can't resurface what was already in the feed — is
+      inserted and marked suppressed_baseline; a failure part-way rolls
+      the stamp back with the rows, so the next tick baselines the whole
+      feed again rather than replaying an unrecorded tail. One row's
+      store failure is logged and skipped so the rest of the scan runs.
+      A scan that loses the race (overlapping heartbeat + client
+      rotation, or a slow tick) re-reads the winner's stamp and treats
+      entries published at or before it — and undated ones, since the
+      feed controls published_at — as baseline, promoting entries dated
+      after the stamp (and deferring, not recording, any dated more than
+      a few minutes past its own clock), so neither the back-catalogue replays as news
+      nor real news gets buried; later ticks process normally. The
+      net effect is that a new watch reports what changes
       from now on rather than replaying the feed's back-catalogue
       (mirrors page_watch's first-observation baseline). Keyed on
       baselined_at, not last_polled_at, so a failed/empty first fetch
@@ -1264,12 +1282,27 @@ external_monitoring:
       feed can't be half-baselined and replay its tail next tick;
       (2) `suppressed_stale` — a signal whose published_at is older than
       EXTERNAL_MONITOR_MAX_SIGNAL_AGE_DAYS (default 7; 0 disables) at
-      capture time is recorded but never promoted. The alert body handed
+      capture time is recorded but never promoted. An entry dated more
+      than EXTERNAL_MONITOR_MAX_FUTURE_SKEW_HOURS (default 24; 0 disables;
+      overridable per row via config_json.max_future_skew_hours, 0..8760,
+      for a calendar or maintenance feed that legitimately dates ahead; an
+      out-of-range or unparseable override is ignored with a warning, never
+      coerced — the adapters use the same value when choosing between an
+      entry's date keys) in the FUTURE is instead
+      deferred — skipped for the tick and NOT recorded, since recording
+      burns the dedup key and would let a feed mute an announcement for
+      good by post-dating it; the poll emits one aggregated
+      `external_signal_deferred` audit row so the skip is visible, and
+      once the date passes the entry is judged like any other. On a
+      lost-race tick the bound is a tight 5-minute drift tolerance
+      instead (nothing the scan fetched can honestly be dated later). The alert body handed
       to triage carries `Published:` (when known) and `Discovered:`
       lines so anything inside the window is still judged on when it
-      happened, not when it was found. Adapters drop a published_at
-      more than a day in the future (a lying feed would otherwise never
-      age out) and collapse whitespace in feed titles so an entry can't
+      happened, not when it was found. Adapters prefer a plausible
+      date key over one more than a day in the future, and keep the
+      future value when every key is implausible so the pipeline can
+      defer it rather than wave an undated entry through; they also
+      collapse whitespace in feed titles so an entry can't
       forge its own labeled body line.
       enrichment_json holds the capture-time relevance read
       (relevance_score 0..1, why_it_matters, matched_initiative) written by

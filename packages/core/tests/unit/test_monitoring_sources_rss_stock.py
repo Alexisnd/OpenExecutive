@@ -156,10 +156,10 @@ async def test_rss_title_newlines_collapsed(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_rss_future_pubdate_is_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A feed claiming an item from the far future is lying; such a value
-    would never age out and would render as an absurd 'ago', so it is
-    treated as no timestamp at all."""
+async def test_rss_future_pubdate_is_kept_for_the_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A feed claiming an item from the far future is lying. The value is
+    kept (not erased) so the pipeline's freshness gate can reject it;
+    dropping it would leave an undated entry that bypasses the gate."""
     future = _SAMPLE_RSS.replace(
         b"Wed, 28 May 2026 12:00:00 GMT", b"Fri, 01 Jan 2100 00:00:00 GMT"
     )
@@ -172,32 +172,31 @@ async def test_rss_future_pubdate_is_dropped(monkeypatch: pytest.MonkeyPatch) ->
         "openexecutive.monitoring.sources.rss.validate_target_url", lambda u: (True, ""),
     )
     signals = await RssSource().poll(_make_item())
-    assert signals[0].published_at is None
+    assert signals[0].published_at == "2100-01-01T00:00:00+00:00"
     assert signals[1].published_at == "2026-05-27T09:00:00+00:00"
 
 
-def test_iso_published_at_parses_atom_and_rfc822() -> None:
-    """Hand-parsed feeds (vendor_status) hand raw strings to the helper."""
-    from datetime import UTC, datetime
+def test_feed_entry_published_at_falls_back_when_published_is_future() -> None:
+    """A bogus future <pubDate> next to a real <updated> must not leave the
+    entry undated — that would bypass the age gate entirely."""
+    import time
+    from datetime import UTC, datetime, timedelta
 
-    from openexecutive.monitoring.sources.base import iso_published_at
+    from openexecutive.monitoring.sources.base import feed_entry_published_at
 
     now = datetime(2026, 9, 7, 12, tzinfo=UTC)
-    assert iso_published_at("2026-09-01T10:00:00Z", now=now) == "2026-09-01T10:00:00+00:00"
-    assert iso_published_at("2026-09-01T06:00:00-04:00", now=now) == "2026-09-01T06:00:00-04:00"
-    assert iso_published_at("Tue, 01 Sep 2026 10:00:00 GMT", now=now) == "2026-09-01T10:00:00+00:00"
-    assert iso_published_at("", now=now) is None
-    assert iso_published_at("not a date", now=now) is None
-    # An absurd numeric zone offset makes parsedate_to_datetime raise
-    # OverflowError; a poisoned entry must not take the whole poll down.
-    assert iso_published_at(
-        "Tue, 01 Sep 2026 10:00:00 +999999999999999999999", now=now
-    ) is None
-    # Naive values are read as UTC; implausibly-future values are dropped.
-    assert iso_published_at("2026-09-01T10:00:00", now=now) == "2026-09-01T10:00:00+00:00"
-    assert iso_published_at("2100-01-01T00:00:00Z", now=now) is None
-    # Skew inside the tolerance (clock drift) is kept.
-    assert iso_published_at("2026-09-07T20:00:00Z", now=now) == "2026-09-07T20:00:00+00:00"
+    future = time.gmtime((now + timedelta(days=1000)).timestamp())
+    past = time.gmtime((now - timedelta(days=200)).timestamp())
+    entry = {"published_parsed": future, "updated_parsed": past}
+    assert feed_entry_published_at(entry, now=now) == (now - timedelta(days=200)).isoformat()
+    # Every key implausible: the (first) future value is kept, not erased,
+    # so the pipeline can defer on it.
+    both = {"published_parsed": future, "updated_parsed": future}
+    assert feed_entry_published_at(both, now=now) == (now + timedelta(days=1000)).isoformat()
+    # Skew 0 (a feed that legitimately dates ahead): no preference, first key wins.
+    assert feed_entry_published_at(entry, now=now, skew=timedelta(0)) == (
+        now + timedelta(days=1000)
+    ).isoformat()
 
 
 def test_rss_is_a_seeding_source() -> None:
