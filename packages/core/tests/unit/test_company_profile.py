@@ -140,49 +140,67 @@ def test_save_to_yaml_is_atomic(tmp_path: Path, monkeypatch):
 def test_save_to_yaml_preserves_mode(tmp_path: Path):
     """Rename creates a new inode; an operator's chmod must survive it.
 
-    0o664 rather than 0o600 on purpose: a fresh profile is already created
-    0o600, and 0o600 is umask-invariant, so it would exercise neither the
-    stat nor the fchmod that carry the mode across.
+    0o664 rather than 0o600 on purpose: the temp file is always created
+    0o600, so a mode equal to the default would pass even if the fchmod
+    that carries the destination's mode across were removed.
     """
     import os
     import stat
 
-    # Pin the umask: under 000, os.open(..., 0o664) alone would yield 0o664
-    # and the fchmod that carries the mode across would go unexercised.
-    old_umask = os.umask(0o022)
-    try:
-        path = tmp_path / "profile.yaml"
-        CompanyProfile(name="Before").save_to_yaml(path)
-        assert stat.S_IMODE(path.stat().st_mode) == 0o600, "fresh profile should be private"
-        os.chmod(path, 0o664)
+    path = tmp_path / "profile.yaml"
+    CompanyProfile(name="Before").save_to_yaml(path)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600, "fresh profile should be private"
+    os.chmod(path, 0o664)
 
-        CompanyProfile(name="After").save_to_yaml(path)
+    CompanyProfile(name="After").save_to_yaml(path)
 
-        assert stat.S_IMODE(path.stat().st_mode) == 0o664
-        assert CompanyProfile.load_from_yaml(path).name == "After"
-        assert [p.name for p in tmp_path.iterdir()] == ["profile.yaml"]
-    finally:
-        os.umask(old_umask)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o664
+    assert CompanyProfile.load_from_yaml(path).name == "After"
+    assert [p.name for p in tmp_path.iterdir()] == ["profile.yaml"]
 
 
 def test_save_to_yaml_through_symlink_keeps_link_and_target_mode(tmp_path: Path):
-    """A symlinked profile path writes the target and never uses the link's 0777."""
+    """A symlinked profile path writes the target and never uses the link's 0777.
+
+    The target is chmod'd 0o640 (not the 0o600 default) so the test also
+    proves the mode carried across came from the target, not the link.
+    """
     import os
     import stat
 
     target = tmp_path / "volume" / "profile.yaml"
     target.parent.mkdir()
     CompanyProfile(name="Before").save_to_yaml(target)
+    os.chmod(target, 0o640)
     link = tmp_path / "profile.yaml"
     link.symlink_to(target)
 
     CompanyProfile(name="After").save_to_yaml(link)
 
     assert link.is_symlink(), "the symlink must survive the save"
-    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
     assert CompanyProfile.load_from_yaml(link).name == "After"
     assert [p.name for p in target.parent.iterdir()] == ["profile.yaml"]
-    assert not os.access(target, os.W_OK) or stat.S_IMODE(target.stat().st_mode) != 0o777
+
+
+def test_save_to_yaml_replaces_a_symlink_loop(tmp_path: Path):
+    """A looped symlink at the profile path is broken config, not a crash.
+
+    Path.resolve() raises RuntimeError on 3.11 for a loop; save_to_yaml must
+    fall back rather than let that escape (the profile-editor route has no
+    handler for it). The loop is replaced by a private regular file.
+    """
+    import stat
+
+    link = tmp_path / "profile.yaml"
+    link.symlink_to(link)
+
+    CompanyProfile(name="X").save_to_yaml(link)
+
+    assert not link.is_symlink()
+    assert stat.S_IMODE(link.stat().st_mode) == 0o600
+    assert CompanyProfile.load_from_yaml(link).name == "X"
+    assert [p.name for p in tmp_path.iterdir()] == ["profile.yaml"]
 
 
 def test_concurrent_saves_do_not_break_each_other(tmp_path: Path):

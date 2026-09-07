@@ -81,8 +81,14 @@ class CompanyProfile(BaseModel):
     def save_to_yaml(self, path: Path | str) -> None:
         # Resolve first so a symlinked profile path (a common deployment
         # pattern for COMPANY_PROFILE_PATH) is written at its target and the
-        # link survives, instead of being replaced by a regular file.
-        path = Path(path).resolve()
+        # link survives, instead of being replaced by a regular file. A
+        # symlink loop raises RuntimeError on 3.11 and OSError on 3.13; fall
+        # back to the unresolved path and let the open() below report it.
+        path = Path(path)
+        try:
+            path = path.resolve()
+        except (OSError, RuntimeError):
+            path = path.absolute()
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {"company": self.model_dump()}
         # Write-then-rename so a failure mid-dump (disk full, unrepresentable
