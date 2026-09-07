@@ -504,26 +504,10 @@ async def _apply_state_from_source(source_dir: Path, settings: Any) -> dict[str,
     )
 
     # ── 5b. Wipe the derived per-company caches ────────────────────────────
-    # Same leak class as the watchlist above, and it lives here — beside the
-    # other unconditional wipes — rather than in ``_seed_episodic_memory``,
-    # because that seeder returns early on a fixture whose ``memory.json`` is
-    # absent or unparseable. ``load_fixture`` only requires ``profile.yaml``,
-    # so such a fixture still swaps the company; wiping inside the seeder
-    # would skip exactly those loads and serve the outgoing company's
-    # narrative under the incoming one. Nothing here is conditional on the
-    # fixture's contents.
-    #
-    # Both caches CREATE TABLE lazily on first put, so a DB that has never
-    # served a briefing lacks them and _delete_all_rows — which is not
-    # per-table existence-guarded — would raise mid-wipe. Initialize first,
-    # exactly as the monitoring schema is handled above. Idempotent.
-    from openexecutive.briefing import narrative_cache
-    from openexecutive.people import insights_cache
-
-    if EPISODIC_DB_PATH.exists():
-        narrative_cache.initialize_db(EPISODIC_DB_PATH)
-        insights_cache.initialize_db(EPISODIC_DB_PATH)
-    caches_cleared = _delete_all_rows(EPISODIC_DB_PATH, PER_CLIENT_CACHE_TABLES)
+    # Same leak class as the watchlist above; see PER_CLIENT_CACHE_TABLES for
+    # why this belongs here rather than in _seed_episodic_memory. Nothing in
+    # this step may become conditional on the fixture's contents.
+    caches_cleared = _wipe_derived_caches(EPISODIC_DB_PATH)
     logger.info("fixture: cleared derived per-company caches: %s", caches_cleared)
 
     # ── 6. Reset the periodic research skip-if-unchanged gate ───────────────
@@ -722,14 +706,10 @@ async def reset_all_state(
         # circuit (and there's nothing to wipe in a DB that isn't there).
         if EPISODIC_DB_PATH.exists():
             monitoring_store.initialize_db(EPISODIC_DB_PATH)
-            # Same reasoning for the derived caches in PER_CLIENT_CACHE_TABLES:
-            # both create their table lazily on first put/get, so a DB that has
-            # never served a briefing lacks them and the DELETE pass would raise.
-            from openexecutive.briefing import narrative_cache
-            from openexecutive.people import insights_cache
-
-            narrative_cache.initialize_db(EPISODIC_DB_PATH)
-            insights_cache.initialize_db(EPISODIC_DB_PATH)
+        # Same reasoning for the derived caches in PER_CLIENT_CACHE_TABLES,
+        # which this DELETE pass also covers; the helper is guarded on the
+        # DB existing, exactly like the monitoring init above.
+        _initialize_derived_cache_schemas(EPISODIC_DB_PATH)
         episodic_cleared = _delete_all_rows(
             EPISODIC_DB_PATH,
             (
@@ -911,6 +891,37 @@ def _delete_all_rows(
     finally:
         conn.close()
     return counts
+
+
+def _initialize_derived_cache_schemas(db_path: Path) -> None:
+    """Create the PER_CLIENT_CACHE_TABLES schemas if the DB already exists.
+
+    Both caches CREATE TABLE lazily on first put, so a DB that has never
+    served a briefing lacks them — and ``_delete_all_rows`` guards only the DB
+    *file*, not each table, so a wipe would raise mid-pass. Idempotent
+    (CREATE TABLE IF NOT EXISTS). Guarded on the DB already existing so we
+    never materialise one the caller never created, which would defeat
+    ``_delete_all_rows``' own exists() short circuit.
+    """
+    if not db_path.exists():
+        return
+    from openexecutive.briefing import narrative_cache
+    from openexecutive.people import insights_cache
+
+    narrative_cache.initialize_db(db_path)
+    insights_cache.initialize_db(db_path)
+
+
+def _wipe_derived_caches(db_path: Path) -> dict[str, int]:
+    """Drop every row of the derived per-company caches; return per-table counts.
+
+    The one place the initialize-then-delete pairing is expressed for callers
+    that wipe only these tables. ``reset_all_state`` folds them into its own
+    single DELETE pass instead (it reports per-table counts for the whole
+    episodic DB), but shares ``_initialize_derived_cache_schemas`` above.
+    """
+    _initialize_derived_cache_schemas(db_path)
+    return _delete_all_rows(db_path, PER_CLIENT_CACHE_TABLES)
 
 
 def get_fixture_status(settings: Any) -> dict[str, Any]:

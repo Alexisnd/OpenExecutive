@@ -159,27 +159,35 @@ def test_delete_clears_derived_caches_on_a_never_briefed_db(
 ) -> None:
     """The cache wipe must work against the live schema, including a cold DB.
 
-    Behavioural, and deliberately routed through ``_delete_all_rows`` — the
-    same helper the call site delegates to — for the reason this module's
-    docstring gives: exercising ``_apply_state_from_source`` end to end would
-    drag ChromaDB, Honcho and an ``app.state`` shim into a unit test.
+    Behavioural, and it calls the production helper ``_wipe_derived_caches``
+    itself rather than re-implementing the initialize-then-delete sequence —
+    otherwise deleting the schema init at the call site would leave this test
+    green, and the cold-DB path would have no coverage at all. Exercising
+    ``_apply_state_from_source`` end to end is what this module's docstring
+    rules out (it would drag ChromaDB, Honcho and an ``app.state`` shim into a
+    unit test); the sibling test below pins that the helper is actually called
+    there, unconditionally.
 
-    The cold-DB half is the regression the author hit: both caches CREATE
-    TABLE lazily on first put, so a DB that has never served a briefing lacks
-    them, and ``_delete_all_rows`` is not per-table existence-guarded. The
-    call site initializes both schemas first; this proves that is sufficient
-    and that the DELETE then really empties warm rows.
+    The cold-DB half is the regression the original fix hit: both caches
+    CREATE TABLE lazily on first put, so a DB that has never served a briefing
+    lacks them, and ``_delete_all_rows`` guards only the DB file, not each
+    table. Removing the init inside ``_wipe_derived_caches`` fails this test.
     """
     from openexecutive.briefing import narrative_cache
-    from openexecutive.cli.fixture_loader import PER_CLIENT_CACHE_TABLES
+    from openexecutive.cli.fixture_loader import (
+        PER_CLIENT_CACHE_TABLES,
+        _wipe_derived_caches,
+    )
     from openexecutive.people import insights_cache
 
     # Cold: neither table exists yet on this DB.
     with sqlite3.connect(str(_episodic_db)) as conn:
+        placeholders = ", ".join("?" * len(PER_CLIENT_CACHE_TABLES))
         present = {
             r[0]
             for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?, ?)",
+                "SELECT name FROM sqlite_master WHERE type='table' "  # noqa: S608
+                f"AND name IN ({placeholders})",
                 PER_CLIENT_CACHE_TABLES,
             )
         }
@@ -188,9 +196,7 @@ def test_delete_clears_derived_caches_on_a_never_briefed_db(
         "the base episodic schema the initialize_db calls at the wipe site "
         "are redundant, but the wipe itself still must not regress."
     )
-    narrative_cache.initialize_db(_episodic_db)
-    insights_cache.initialize_db(_episodic_db)
-    _delete_all_rows(_episodic_db, PER_CLIENT_CACHE_TABLES)  # must not raise
+    _wipe_derived_caches(_episodic_db)  # must not raise on a cold DB
 
     # Warm: rows written by the outgoing company are actually removed.
     narrative_cache.put(
@@ -214,14 +220,14 @@ def test_delete_clears_derived_caches_on_a_never_briefed_db(
     assert narrative_cache.get("principal", db_path=_episodic_db) is not None
     assert insights_cache.get(1, db_path=_episodic_db) is not None
 
-    _delete_all_rows(_episodic_db, PER_CLIENT_CACHE_TABLES)
+    _wipe_derived_caches(_episodic_db)
 
     assert narrative_cache.get("principal", db_path=_episodic_db) is None
     assert insights_cache.get(1, db_path=_episodic_db) is None
 
 
-def test_fixture_path_wipes_caches_unconditionally() -> None:
-    """The fixture-path wipe must not sit behind ``memory.json``.
+def test_fixture_path_cache_wipe_is_unconditional() -> None:
+    """The fixture-path wipe must not sit behind ``memory.json`` — structurally.
 
     ``_seed_episodic_memory`` returns early when the fixture has no
     ``memory.json``, when that file will not parse, and when the DB is
@@ -230,10 +236,15 @@ def test_fixture_path_wipes_caches_unconditionally() -> None:
     placed inside the seeder is skipped on exactly those loads, leaving the
     outgoing company's narrative to be served under the incoming one.
 
-    So the wipe belongs in ``_apply_state_from_source``, beside the
-    unconditional watchlist wipe, and must stay out of the seeder. This pins
-    both halves; the sibling test above proves the deletion itself works.
+    A substring search for the constant would not catch a regression here: it
+    passes just as happily when the wipe is present but wrapped in an ``if``.
+    So walk the AST and require the wipe to be a *direct* child of the
+    function body — no enclosing conditional, loop, or try. The sibling test
+    above proves the deletion itself works; this one proves it always runs.
     """
+    import ast
+    import textwrap
+
     from openexecutive.cli.fixture_loader import (
         PER_CLIENT_CACHE_TABLES,
         _seed_episodic_memory,
@@ -241,10 +252,35 @@ def test_fixture_path_wipes_caches_unconditionally() -> None:
 
     assert PER_CLIENT_CACHE_TABLES == ("briefing_narrative", "person_insights")
 
-    assert "PER_CLIENT_CACHE_TABLES" in inspect.getsource(_apply_state_from_source), (
-        "_apply_state_from_source no longer wipes the derived caches — fixture "
-        "load/unload will serve the outgoing company's briefing narrative "
-        "under the incoming one."
+    fn = ast.parse(
+        textwrap.dedent(inspect.getsource(_apply_state_from_source))
+    ).body[0]
+    assert isinstance(fn, ast.AsyncFunctionDef)
+
+    def _wipes(node: ast.AST) -> bool:
+        """True if ``node`` contains a call to the wipe helper."""
+        return any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "_wipe_derived_caches"
+            for call in ast.walk(node)
+        )
+
+    # Only leaf statements count. ``ast.walk`` descends, so testing every
+    # member of ``fn.body`` would also accept a wipe nested inside a top-level
+    # ``if``/``for``/``try`` — precisely the regression this pins against. A
+    # wrapping compound statement is none of these three node types, so
+    # nesting the call makes this assertion fail.
+    assert any(
+        _wipes(stmt)
+        for stmt in fn.body
+        if isinstance(stmt, (ast.Expr, ast.Assign, ast.AnnAssign))
+    ), (
+        "_apply_state_from_source does not call _wipe_derived_caches as a "
+        "top-level statement — either the wipe is gone, or it is nested in a "
+        "conditional. A fixture load whose memory.json is absent or unparseable "
+        "still swaps the company, so a gated wipe leaves the outgoing company's "
+        "briefing narrative to be served under the incoming one."
     )
     assert "PER_CLIENT_CACHE_TABLES" not in inspect.getsource(_seed_episodic_memory), (
         "the derived-cache wipe moved back into _seed_episodic_memory, which "
