@@ -147,16 +147,42 @@ def test_save_to_yaml_preserves_mode(tmp_path: Path):
     import os
     import stat
 
-    path = tmp_path / "profile.yaml"
-    CompanyProfile(name="Before").save_to_yaml(path)
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600, "fresh profile should be private"
-    os.chmod(path, 0o664)
+    # Pin the umask: under 000, os.open(..., 0o664) alone would yield 0o664
+    # and the fchmod that carries the mode across would go unexercised.
+    old_umask = os.umask(0o022)
+    try:
+        path = tmp_path / "profile.yaml"
+        CompanyProfile(name="Before").save_to_yaml(path)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600, "fresh profile should be private"
+        os.chmod(path, 0o664)
 
-    CompanyProfile(name="After").save_to_yaml(path)
+        CompanyProfile(name="After").save_to_yaml(path)
 
-    assert stat.S_IMODE(path.stat().st_mode) == 0o664
-    assert CompanyProfile.load_from_yaml(path).name == "After"
-    assert [p.name for p in tmp_path.iterdir()] == ["profile.yaml"]
+        assert stat.S_IMODE(path.stat().st_mode) == 0o664
+        assert CompanyProfile.load_from_yaml(path).name == "After"
+        assert [p.name for p in tmp_path.iterdir()] == ["profile.yaml"]
+    finally:
+        os.umask(old_umask)
+
+
+def test_save_to_yaml_through_symlink_keeps_link_and_target_mode(tmp_path: Path):
+    """A symlinked profile path writes the target and never uses the link's 0777."""
+    import os
+    import stat
+
+    target = tmp_path / "volume" / "profile.yaml"
+    target.parent.mkdir()
+    CompanyProfile(name="Before").save_to_yaml(target)
+    link = tmp_path / "profile.yaml"
+    link.symlink_to(target)
+
+    CompanyProfile(name="After").save_to_yaml(link)
+
+    assert link.is_symlink(), "the symlink must survive the save"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert CompanyProfile.load_from_yaml(link).name == "After"
+    assert [p.name for p in target.parent.iterdir()] == ["profile.yaml"]
+    assert not os.access(target, os.W_OK) or stat.S_IMODE(target.stat().st_mode) != 0o777
 
 
 def test_concurrent_saves_do_not_break_each_other(tmp_path: Path):

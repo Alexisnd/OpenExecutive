@@ -79,7 +79,10 @@ class CompanyProfile(BaseModel):
         return cls.model_validate(company_data)
 
     def save_to_yaml(self, path: Path | str) -> None:
-        path = Path(path)
+        # Resolve first so a symlinked profile path (a common deployment
+        # pattern for COMPANY_PROFILE_PATH) is written at its target and the
+        # link survives, instead of being replaced by a regular file.
+        path = Path(path).resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {"company": self.model_dump()}
         # Write-then-rename so a failure mid-dump (disk full, unrepresentable
@@ -92,33 +95,35 @@ class CompanyProfile(BaseModel):
         #   os.fdopen) keeps the explicit-encoding contract visible.
         # - A random component plus O_EXCL: two processes on one volume
         #   (both PID 1 in their containers) cannot collide.
+        # - The temp is always created 0600 and only widened to the
+        #   destination's mode after fsync, right before the rename. A
+        #   crash leftover (SIGKILL, OOM) is therefore private clutter,
+        #   never a readable copy of the financials. There is no sweep of
+        #   leftovers: one cannot be told apart from another process's
+        #   in-flight file, and unlinking that makes its rename fail.
         # - The destination's mode is carried over: rename creates a new
         #   inode, so a file an operator chmod'd 0600 would otherwise
-        #   silently revert to the umask default.
+        #   silently revert to the umask default. A symlink's own mode
+        #   (always 0777) is never used.
         # - fsync file and directory: a hard crash between write and
         #   rename must not leave a zero-length profile.
-        # There is deliberately no sweep of stale temps: a sweep cannot
-        # tell a crashed writer's leftover from another process's
-        # in-flight file, and unlinking the latter makes its rename fail.
-        # A leftover is 0600 clutter, not a leak.
         tmp_path = path.with_name(f".tmp-{os.getpid()}-{secrets.token_hex(4)}-{path.name}")
         existing_mode: int | None = None
         with contextlib.suppress(OSError):
-            # lstat: never take the mode from a symlink's target.
-            existing_mode = stat.S_IMODE(path.lstat().st_mode)
+            st = path.lstat()
+            if not stat.S_ISLNK(st.st_mode):
+                existing_mode = stat.S_IMODE(st.st_mode)
 
         def _exclusive(p: str, flags: int) -> int:
-            return os.open(p, flags | os.O_EXCL, 0o600 if existing_mode is None else existing_mode)
+            return os.open(p, flags | os.O_EXCL, 0o600)
 
         try:
             with open(tmp_path, "w", encoding="utf-8", opener=_exclusive) as f:
-                if existing_mode is not None and hasattr(os, "fchmod"):
-                    # os.open applies the umask; fchmod restores the exact
-                    # mode the destination had. Unix only.
-                    os.fchmod(f.fileno(), existing_mode)
                 yaml.dump(data, f, default_flow_style=False, sort_keys=True)
                 f.flush()
                 os.fsync(f.fileno())
+                if existing_mode is not None and hasattr(os, "fchmod"):
+                    os.fchmod(f.fileno(), existing_mode)
             os.replace(tmp_path, path)
             with contextlib.suppress(OSError):
                 dir_fd = os.open(path.parent, os.O_RDONLY)
