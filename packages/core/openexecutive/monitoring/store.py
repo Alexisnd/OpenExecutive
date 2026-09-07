@@ -80,6 +80,7 @@ def initialize_db(db_path: Path | None = None) -> None:
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 last_polled_at TEXT,
+                baselined_at TEXT,
                 last_fired_at TEXT,
                 fired_count INTEGER NOT NULL DEFAULT 0,
                 dismiss_count INTEGER NOT NULL DEFAULT 0,
@@ -134,19 +135,44 @@ def initialize_db(db_path: Path | None = None) -> None:
         # Upstream publish timestamp (issue #80). Nullable: pre-existing rows
         # and sources without an upstream timestamp carry NULL.
         _ensure_column(conn, "external_signals", "published_at", "TEXT")
+        # The ALTER and its one-time backfill must land together: the
+        # sqlite3 driver autocommits DDL, so without an explicit BEGIN a
+        # crash between the two would leave the column present (so the
+        # backfill never re-runs) but every already-polled row un-
+        # baselined — and the next tick would swallow their new entries.
+        conn.execute("BEGIN")
+        try:
+            if _ensure_column(conn, "watchlist", "baselined_at", "TEXT"):
+                # Rows polled before this column existed have already
+                # surfaced whatever their feed held; treat them as
+                # baselined so the upgrade tick doesn't swallow genuinely
+                # new entries.
+                conn.execute(
+                    "UPDATE watchlist SET baselined_at = last_polled_at "
+                    "WHERE baselined_at IS NULL AND last_polled_at IS NOT NULL"
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
 
 def _ensure_column(
     conn: sqlite3.Connection, table: str, column: str, decl: str
-) -> None:
+) -> bool:
     """Add ``column`` to ``table`` if it isn't already present. Idempotent.
+
+    Returns True when the column was added on this call, so a caller can
+    run a one-time backfill exactly once.
 
     Table + column names are internal constants (never user input), so the
     f-string interpolation here carries no injection surface.
     """
     cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-    if column not in cols:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    if column in cols:
+        return False
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    return True
 
 
 # --------------------------------------------------------------------- #
@@ -280,6 +306,23 @@ def mark_polled(
     with _get_conn(db_path) as conn:
         conn.execute(
             "UPDATE watchlist SET last_polled_at = ? WHERE id = ?",
+            (at.isoformat(), item_id),
+        )
+
+
+def mark_baselined(
+    item_id: int,
+    at: datetime,
+    db_path: Path | None = None,
+) -> None:
+    """Record that a seeding source's back-catalogue has been captured.
+
+    Called once, after the first poll that returned entries; from then on
+    the pipeline promotes new entries instead of baselining them.
+    """
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            "UPDATE watchlist SET baselined_at = ? WHERE id = ?",
             (at.isoformat(), item_id),
         )
 

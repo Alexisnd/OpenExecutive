@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import calendar
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -76,15 +77,32 @@ class Source(Protocol):
 __all__ = ["Signal", "Source"]
 
 
-def feed_entry_published_at(entry: Mapping[str, Any]) -> str | None:
+# A feed claiming an item was published more than this far in the future is
+# lying (or has a broken clock). Such a value would never age out and would
+# render as a huge "ago", so it's treated as no timestamp at all.
+_MAX_FUTURE_SKEW = timedelta(days=1)
+
+
+def _as_published_at(dt: datetime, now: datetime | None) -> str | None:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    if dt > (now or datetime.now(UTC)) + _MAX_FUTURE_SKEW:
+        return None
+    return dt.isoformat()
+
+
+def feed_entry_published_at(
+    entry: Mapping[str, Any], *, now: datetime | None = None
+) -> str | None:
     """ISO 8601 UTC publish timestamp of a feedparser entry, or None.
 
     feedparser normalises ``<pubDate>`` / ``<published>`` / ``<updated>``
     into ``*_parsed`` ``time.struct_time`` values already converted to
     UTC; we prefer ``published`` (when the item first appeared) over
-    ``updated`` (last edit). Entries with no parseable date return None —
-    the pipeline's age gate then can't judge them, and only the first-poll
-    baseline protects against replaying them as new.
+    ``updated`` (last edit). Entries with no parseable date — or a date
+    past ``_MAX_FUTURE_SKEW`` — return None: the pipeline's age gate then
+    can't judge them, and only the first-poll baseline protects against
+    replaying them as new.
     """
     for key in ("published_parsed", "updated_parsed"):
         st = entry.get(key)
@@ -93,7 +111,41 @@ def feed_entry_published_at(entry: Mapping[str, Any]) -> str | None:
         try:
             # struct_time is already UTC (feedparser normalises), so timegm —
             # never mktime, which would apply the host's local offset.
-            return datetime.fromtimestamp(calendar.timegm(st), tz=UTC).isoformat()
+            dt = datetime.fromtimestamp(calendar.timegm(st), tz=UTC)
         except (TypeError, ValueError, OverflowError, OSError):
             continue
+        return _as_published_at(dt, now)
     return None
+
+
+def iso_published_at(value: str, *, now: datetime | None = None) -> str | None:
+    """Parse a raw ``<updated>`` (ISO 8601) or ``<pubDate>`` (RFC 822) string.
+
+    For adapters that parse XML by hand (vendor_status) rather than via
+    feedparser. Same contract as ``feed_entry_published_at``: ISO 8601 UTC
+    or None when the value is empty, unparseable, or implausibly future.
+    """
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        try:
+            dt = parsedate_to_datetime(value)
+        except (TypeError, ValueError, IndexError, OverflowError, OSError):
+            # OverflowError: absurd numeric zone offsets; a poisoned entry
+            # must not take the whole feed's poll down with it.
+            return None
+    return _as_published_at(dt, now)
+
+
+def collapse_whitespace(text: str) -> str:
+    """Fold runs of whitespace (including newlines) into single spaces.
+
+    Feed titles reach ``normalized_summary``, which is the FIRST line of
+    the alert body the triage prompt reads as labeled lines; an embedded
+    newline would let a feed forge its own ``Severity hint:`` /
+    ``Published:`` line. Collapsing at the adapter boundary closes that.
+    """
+    return " ".join((text or "").split())

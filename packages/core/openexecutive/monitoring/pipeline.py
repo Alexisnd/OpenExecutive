@@ -53,6 +53,7 @@ from openexecutive.monitoring.models import (
 )
 from openexecutive.monitoring.sources import get_source_for_kind
 from openexecutive.monitoring.sources._http import strip_url_query
+from openexecutive.monitoring.sources.base import collapse_whitespace
 
 logger = logging.getLogger(__name__)
 
@@ -208,9 +209,13 @@ def _signal_to_alert_event(
     ``why_it_matters`` is surfaced high in the body so triage and the
     principal see the company-specific relevance, not just the raw event.
     """
-    parts: list[str] = [signal.normalized_summary]
+    # The summary is line 1 of a body the triage prompt reads as labeled
+    # lines; collapse whitespace here (whatever the adapter did) so no
+    # source — feed title, model-emitted query hit — can forge its own
+    # ``Severity hint:`` / ``Published:`` line.
+    parts: list[str] = [collapse_whitespace(signal.normalized_summary)]
     if enrichment:
-        why = str(enrichment.get("why_it_matters") or "").strip()
+        why = collapse_whitespace(str(enrichment.get("why_it_matters") or ""))
         if why:
             parts.append(f"Why this matters: {why}")
     # Slug + severity hint are required by the triage prompt's
@@ -336,11 +341,16 @@ async def _poll_one_watchlist_item(
     cap_remaining: int,
     company_ctx: str = "",
     db_path: Path | None = None,
-) -> int:
+) -> tuple[int, int]:
     """Poll one watchlist row, persist signals, promote where appropriate.
 
-    Returns the number of signals written to the DB on this tick (NOT
-    the number alerted — some get suppressed by floor / dry_run / dup).
+    Returns ``(written, admitted)``: rows landed in ``external_signals``
+    on this tick (NOT the number alerted — some get suppressed by floor /
+    dry_run / dup), and how many of those count against the scan-wide
+    ``max_signals_per_scan`` cap. Baseline rows are written but not
+    admitted: they never reach the alert pipeline the cap protects, and
+    counting them would truncate the baseline mid-feed and let the tail
+    replay as news on the next tick.
     """
     src = get_source_for_kind(item.signal_type)
     if src is None:
@@ -349,15 +359,8 @@ async def _poll_one_watchlist_item(
             "(watchlist slug=%r) — skipping",
             item.signal_type, item.slug,
         )
-        return 0
+        return 0, 0
 
-    # First poll of this row → feed-listing sources are baselined (see
-    # Source.seed_on_first_poll). Read BEFORE the poll: ``mark_polled`` in
-    # the ``finally`` below flips the DB row, and ``item`` is the pre-poll
-    # snapshot. A failed first fetch still marks the row polled, so the
-    # next successful poll is NOT a baseline — the age gate below is the
-    # backstop for that case.
-    is_baseline_poll = item.last_polled_at is None and src.seed_on_first_poll
     max_age_days = get_settings().external_monitor_max_signal_age_days
 
     try:
@@ -367,7 +370,7 @@ async def _poll_one_watchlist_item(
             "monitoring.pipeline: adapter %s crashed for watchlist %r",
             item.signal_type, item.slug,
         )
-        return 0
+        return 0, 0
     finally:
         # Always mark polled even on adapter crash so a broken source
         # doesn't get hammered on every tick.
@@ -375,11 +378,24 @@ async def _poll_one_watchlist_item(
             store.mark_polled(item.id, now, db_path=db_path)
 
     if not emitted:
-        return 0
+        # Failed or empty fetch: nothing to baseline, and ``baselined_at``
+        # stays NULL so the next successful poll IS the baseline.
+        return 0, 0
+
+    # Feed-listing sources (Source.seed_on_first_poll) are baselined on
+    # the first poll that returns entries: everything already in the feed
+    # is recorded as seen, nothing is promoted. Keyed on ``baselined_at``
+    # rather than ``last_polled_at`` so a transient fetch failure on the
+    # first tick can't forfeit the baseline. ``item`` is the pre-poll
+    # snapshot, so the in-memory value is unaffected by ``mark_polled``.
+    is_baseline_poll = (
+        getattr(src, "seed_on_first_poll", False) and item.baselined_at is None
+    )
 
     written = 0
+    admitted = 0
     for raw_signal in emitted:
-        if cap_remaining <= 0:
+        if not is_baseline_poll and cap_remaining <= 0:
             logger.info(
                 "monitoring.pipeline: max_signals_per_scan cap hit at "
                 "watchlist %r (signal_type=%s) — dropping remaining %d",
@@ -408,8 +424,10 @@ async def _poll_one_watchlist_item(
             # vendor status page returns the same 25 entries every poll.
             continue
 
-        cap_remaining -= 1
         written += 1
+        if not is_baseline_poll:
+            cap_remaining -= 1
+            admitted += 1
         audit_log(
             "external_signal_received",
             f"Signal received: {signal.normalized_summary[:120]}",
@@ -516,7 +534,15 @@ async def _poll_one_watchlist_item(
             enrichment=enrichment_payload,
         )
 
-    return written
+    if is_baseline_poll and item.id is not None:
+        store.mark_baselined(item.id, now, db_path=db_path)
+        logger.info(
+            "monitoring.pipeline: baselined %r (%s) — %d existing entr%s "
+            "recorded, none promoted",
+            item.slug, item.signal_type, written, "y" if written == 1 else "ies",
+        )
+
+    return written, admitted
 
 
 async def _maybe_enrich(
@@ -616,11 +642,11 @@ async def run_external_monitor_scan(
         if not _due_for_poll(item, now):
             continue
         per_source_start = datetime.now(UTC)
-        written = await _poll_one_watchlist_item(
+        written, admitted = await _poll_one_watchlist_item(
             item, now, cap_remaining=cap_remaining,
             company_ctx=company_ctx, db_path=db_path,
         )
-        cap_remaining -= written
+        cap_remaining -= admitted
         total_written += written
         duration_ms = int(
             (datetime.now(UTC) - per_source_start).total_seconds() * 1000

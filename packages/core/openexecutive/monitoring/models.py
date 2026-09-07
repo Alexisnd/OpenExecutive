@@ -87,6 +87,12 @@ class WatchlistItem(BaseModel):
     enabled: bool = True
     created_at: str = ""
     last_polled_at: str | None = None
+    # Set once a seeding source (Source.seed_on_first_poll) has completed a
+    # poll that returned entries, i.e. the feed's existing back-catalogue
+    # has been recorded as seen. NULL until then — a failed or empty first
+    # fetch leaves the NEXT successful poll as the baseline. Never set for
+    # non-seeding sources.
+    baselined_at: str | None = None
     last_fired_at: str | None = None
     fired_count: int = 0
     dismiss_count: int = 0

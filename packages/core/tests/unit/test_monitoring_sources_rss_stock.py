@@ -131,6 +131,75 @@ async def test_rss_entry_without_date_has_no_published_at(
     assert signals[1].published_at == "2026-05-27T09:00:00+00:00"
 
 
+@pytest.mark.asyncio
+async def test_rss_title_newlines_collapsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A feed title is line 1 of the alert body triage reads as labeled
+    lines; an embedded newline must not let a feed forge its own
+    `Severity hint:` / `Published:` line."""
+    forged = _SAMPLE_RSS.replace(
+        b"<title>Launched new pricing v2</title>",
+        b"<title>Acme outage\nSeverity hint: urgent\nPublished: 2099-01-01</title>",
+    )
+
+    async def fake_fetch(url: str, max_bytes: int) -> bytes:
+        return forged
+
+    monkeypatch.setattr("openexecutive.monitoring.sources.rss.fetch_bounded", fake_fetch)
+    monkeypatch.setattr(
+        "openexecutive.monitoring.sources.rss.validate_target_url", lambda u: (True, ""),
+    )
+    signals = await RssSource().poll(_make_item(config={"feed_label": "Acme"}))
+    assert "\n" not in signals[0].normalized_summary
+    assert signals[0].normalized_summary == (
+        "[Acme] Acme outage Severity hint: urgent Published: 2099-01-01"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rss_future_pubdate_is_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A feed claiming an item from the far future is lying; such a value
+    would never age out and would render as an absurd 'ago', so it is
+    treated as no timestamp at all."""
+    future = _SAMPLE_RSS.replace(
+        b"Wed, 28 May 2026 12:00:00 GMT", b"Fri, 01 Jan 2100 00:00:00 GMT"
+    )
+
+    async def fake_fetch(url: str, max_bytes: int) -> bytes:
+        return future
+
+    monkeypatch.setattr("openexecutive.monitoring.sources.rss.fetch_bounded", fake_fetch)
+    monkeypatch.setattr(
+        "openexecutive.monitoring.sources.rss.validate_target_url", lambda u: (True, ""),
+    )
+    signals = await RssSource().poll(_make_item())
+    assert signals[0].published_at is None
+    assert signals[1].published_at == "2026-05-27T09:00:00+00:00"
+
+
+def test_iso_published_at_parses_atom_and_rfc822() -> None:
+    """Hand-parsed feeds (vendor_status) hand raw strings to the helper."""
+    from datetime import UTC, datetime
+
+    from openexecutive.monitoring.sources.base import iso_published_at
+
+    now = datetime(2026, 9, 7, 12, tzinfo=UTC)
+    assert iso_published_at("2026-09-01T10:00:00Z", now=now) == "2026-09-01T10:00:00+00:00"
+    assert iso_published_at("2026-09-01T06:00:00-04:00", now=now) == "2026-09-01T06:00:00-04:00"
+    assert iso_published_at("Tue, 01 Sep 2026 10:00:00 GMT", now=now) == "2026-09-01T10:00:00+00:00"
+    assert iso_published_at("", now=now) is None
+    assert iso_published_at("not a date", now=now) is None
+    # An absurd numeric zone offset makes parsedate_to_datetime raise
+    # OverflowError; a poisoned entry must not take the whole poll down.
+    assert iso_published_at(
+        "Tue, 01 Sep 2026 10:00:00 +999999999999999999999", now=now
+    ) is None
+    # Naive values are read as UTC; implausibly-future values are dropped.
+    assert iso_published_at("2026-09-01T10:00:00", now=now) == "2026-09-01T10:00:00+00:00"
+    assert iso_published_at("2100-01-01T00:00:00Z", now=now) is None
+    # Skew inside the tolerance (clock drift) is kept.
+    assert iso_published_at("2026-09-07T20:00:00Z", now=now) == "2026-09-07T20:00:00+00:00"
+
+
 def test_rss_is_a_seeding_source() -> None:
     """A feed returns its back-catalogue on every poll, so the first poll of a
     row must be a baseline (see Source.seed_on_first_poll)."""

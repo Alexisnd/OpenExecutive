@@ -1224,8 +1224,12 @@ external_monitoring:
       Columns: id, slug, signal_type, target, config_json, trigger_json,
       cadence, severity_floor, severity_ceiling, route_to_specialist,
       route_to_department, route_to_person_id, mode ('active' | 'dry_run'),
-      enabled, created_at, last_polled_at, last_fired_at, fired_count,
-      dismiss_count, trust_score, notes.
+      enabled, created_at, last_polled_at, baselined_at, last_fired_at,
+      fired_count, dismiss_count, trust_score, notes.
+      baselined_at (nullable, additive ALTER; backfilled from
+      last_polled_at for rows that were already being polled when the
+      column landed) is set once a seeding source's first poll that
+      returned entries has been recorded — see external_signals below.
       UNIQUE(slug). Indexed on (enabled, signal_type) for the scan
       walker.
     external_signals (in episodic_memory.db): |
@@ -1247,18 +1251,26 @@ external_monitoring:
       filing date; NULL for stock / page_watch / query. The two are never
       conflated (issue #80). Two freshness gates run FIRST in the
       suppression cascade, before dry_run / floor / enrichment, so they
-      never spend an LLM call: (1) `suppressed_baseline` — on the FIRST
-      poll of a row (last_polled_at IS NULL) whose adapter declares
-      `seed_on_first_poll` (rss, edgar), every entry in the feed is
-      recorded as seen and nothing is promoted, so a new watch reports
-      what changes from now on rather than replaying the feed's
-      back-catalogue (mirrors page_watch's first-observation baseline);
+      never spend an LLM call: (1) `suppressed_baseline` — on the first
+      poll that RETURNS ENTRIES for a row whose adapter declares
+      `seed_on_first_poll` (rss, edgar) and whose `baselined_at` is NULL,
+      every entry in the feed is recorded as seen, nothing is promoted,
+      and `baselined_at` is set — so a new watch reports what changes
+      from now on rather than replaying the feed's back-catalogue
+      (mirrors page_watch's first-observation baseline). Keyed on
+      baselined_at, not last_polled_at, so a failed/empty first fetch
+      leaves the next successful poll as the baseline; baseline rows are
+      written but do NOT count against max_signals_per_scan, so a big
+      feed can't be half-baselined and replay its tail next tick;
       (2) `suppressed_stale` — a signal whose published_at is older than
       EXTERNAL_MONITOR_MAX_SIGNAL_AGE_DAYS (default 7; 0 disables) at
       capture time is recorded but never promoted. The alert body handed
       to triage carries `Published:` (when known) and `Discovered:`
       lines so anything inside the window is still judged on when it
-      happened, not when it was found.
+      happened, not when it was found. Adapters drop a published_at
+      more than a day in the future (a lying feed would otherwise never
+      age out) and collapse whitespace in feed titles so an entry can't
+      forge its own labeled body line.
       enrichment_json holds the capture-time relevance read
       (relevance_score 0..1, why_it_matters, matched_initiative) written by
       the enrichment stage; '{}' when enrichment is off or missed. Added via
@@ -1289,7 +1301,7 @@ external_monitoring:
       `Source` instance that handles it. New adapters register here;
       add a top-level fact in this YAML when they ship.
     shipped:
-      - "vendor_status — polls Statuspage Atom history feeds (AWS, Stripe, Twilio, GitHub, Cloudflare, …) and emits one Signal per incident entry. Severity hint HIGH by default. Optional `trigger_json.keywords` narrows to entries whose title contains a keyword."
+      - "vendor_status — polls Statuspage Atom history feeds (AWS, Stripe, Twilio, GitHub, Cloudflare, …) and emits one Signal per incident entry. Severity hint HIGH by default. Optional `trigger_json.keywords` narrows to entries whose title contains a keyword. Deliberately outside BOTH #80 freshness gates (no published_at, not seeded): an incident's entry id never changes across updates and a suppressed insert burns the dedup key, so either gate would permanently mute an incident that is open (or quiet for a week) when the watch is added. New watches therefore still replay the history feed's resolved incidents — follow-up: dedup on id+<updated> or an open/resolved filter."
       - "rss — generic Atom/RSS feed adapter via feedparser; handles competitor changelogs, layoffs.fyi, USPTO patent feeds, regulatory filings, blog RSS. Severity hint LOW by default (most RSS is noisy). Optional `trigger_json.keywords` filters by title + summary. Each entry's <pubDate>/<updated> is parsed into Signal.published_at; declares `seed_on_first_poll` so a new watch baselines the feed's existing entries instead of firing them, and entries older than EXTERNAL_MONITOR_MAX_SIGNAL_AGE_DAYS are recorded as `suppressed_stale` (issue #80)."
       - "stock — Yahoo Finance Chart endpoint (the same endpoint yfinance scrapes, used directly via httpx to avoid pandas/numpy). Watchlist `target` is the ticker; signals fire when |intraday vs previous close| ≥ `trigger.abs_change_pct_gte` (default 5%). Severity hint scales with the magnitude of the move (≥10% URGENT, ≥5% HIGH, ≥2% MEDIUM, else LOW). v2 candidate: swap behind the same Source interface for a paid Alpha Vantage / Finnhub feed if Yahoo brittleness bites."
       - "query — standing web-search query. Watchlist `target` is a natural-language query (e.g. 'Acme Corp layoffs OR restructuring OR funding'); each poll runs it through `BaseAgent.analyze_with_tools` with the web_search tool (model pinned to `get_research_model()`, honouring an OpenRouter Council override — the provider layer translates native web_search into OpenRouter's `plugins:[{id:web}]`, see providers/translator). The model reports distinct results via the `emit_query_results` tool; each result with a valid clickable URL becomes a Signal (the adapter emits a flat severity hint LOW because it can't judge materiality per-hit — the pipeline regrades this from the capture-time relevance read BEFORE the floor gate via `_grade_query_severity`, so a material hit clears a medium/high floor instead of being suppressed; dedup key `query:` + first 32 hex chars of sha256(slug + NUL + canonical_url); URL-less results dropped to uphold the provenance invariant). UNLIKE the keyless feed adapters this source is BILLED (one LLM call + web searches per poll), so it polls slowly (default 360 min), is bounded by `web_search_max_uses` + per-row `config.max_results` (default 5, ceiling 10), and has its own kill switch `EXTERNAL_MONITOR_QUERY_ENABLED`. Optional `trigger.keywords` filters like rss; `config.allowed_domains`/`blocked_domains` are best-effort prompt hints only (NOT enforced, and not honoured by the OpenRouter web plugin). This is the 'watch arbitrary conditions' primitive that no feed publishes."

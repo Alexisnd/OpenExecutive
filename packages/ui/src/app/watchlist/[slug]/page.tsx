@@ -17,6 +17,10 @@ function formatRelTime(iso: string | null): string {
   if (!iso) return "never";
   try {
     const diff = new Date(iso).getTime() - Date.now();
+    // Callers render "<x> ago"; a timestamp slightly ahead of the browser
+    // clock (published_at within the server's skew tolerance) is "now",
+    // never a fabricated past.
+    if (diff > 0) return "now";
     const abs = Math.abs(diff);
     if (abs < 60_000) return "now";
     if (abs < 3_600_000) return `${Math.round(abs / 60_000)}m`;

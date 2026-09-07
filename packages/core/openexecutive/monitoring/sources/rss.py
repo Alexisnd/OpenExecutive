@@ -56,7 +56,10 @@ from openexecutive.monitoring.sources._http import (
     strip_url_query,
     validate_target_url,
 )
-from openexecutive.monitoring.sources.base import feed_entry_published_at
+from openexecutive.monitoring.sources.base import (
+    collapse_whitespace,
+    feed_entry_published_at,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +132,7 @@ class RssSource:
             if not entry_id:
                 # No stable upstream id → no reliable dedup → skip.
                 continue
-            title = (entry.get("title") or "").strip() or "(untitled)"
+            title = collapse_whitespace(entry.get("title") or "") or "(untitled)"
             link = strip_url_query((entry.get("link") or "").strip())
             summary = f"[{feed_label}] {title}"
             signals.append(Signal(

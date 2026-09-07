@@ -52,6 +52,7 @@ from openexecutive.monitoring.sources._http import (
     strip_url_query,
     validate_target_url,
 )
+from openexecutive.monitoring.sources.base import collapse_whitespace
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,14 @@ _MAX_ENTRIES_PER_FEED = 100
 class VendorStatusSource:
     kind: str = SOURCE_KIND_VENDOR_STATUS
     default_poll_interval_minutes: int = 5
-    # Open incidents on a vendor we just started watching are actionable now.
+    # Deliberately outside BOTH freshness gates. An incident's entry id
+    # never changes across its updates, and a suppressed insert burns the
+    # dedup key, so either a first-poll baseline or an age gate on
+    # <updated> would permanently mute an incident that is open (or goes
+    # quiet for a week) when the watch is added. The history feed does
+    # replay resolved incidents on a new watch; fixing that needs a dedup
+    # key that includes <updated> or an open/resolved filter — tracked as
+    # a follow-up, not folded into the #80 gates.
     seed_on_first_poll: bool = False
 
     async def poll(
@@ -131,7 +139,7 @@ class VendorStatusSource:
                 # rather than emit a noisy hash-of-title signal that
                 # would re-fire on every minor edit.
                 continue
-            title = (entry.get("title") or "").strip() or "(untitled incident)"
+            title = collapse_whitespace(entry.get("title") or "") or "(untitled incident)"
             summary = f"[{vendor_label}] {title}"
             dedup_key = _make_dedup_key(item.slug, entry_id)
             signals.append(Signal(

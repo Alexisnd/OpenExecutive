@@ -468,6 +468,7 @@ def test_first_poll_baselines_seeding_source(
     item = ms.list_watchlist(db_path=db)[0]
     assert item.fired_count == 0
     assert item.last_polled_at is not None
+    assert item.baselined_at is not None
 
     # Tick 2 — a genuinely new entry appears alongside the old ones.
     fake._signals.append(
@@ -479,6 +480,127 @@ def test_first_poll_baselines_seeding_source(
     outcomes = {r["dedup_key"]: r["processed_outcome"] for r in ms.list_recent_signals(db_path=db)}
     assert outcomes["vendor_status:e3"] == OUTCOME_ALERTED
     assert outcomes["vendor_status:e1"] == OUTCOME_SUPPRESSED_BASELINE  # untouched
+
+
+def test_failed_first_fetch_does_not_forfeit_baseline(
+    db: Path,
+    install_fake_source,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient 503 on the first tick returns [] from the adapter. The
+    row is marked polled but NOT baselined, so the next successful poll
+    is still the baseline — otherwise the feed's whole recent window
+    would replay as news 30 minutes later."""
+    promoted = _install_promotion_recorder(monkeypatch)
+    ms.insert_watchlist_item(
+        slug="acme-changelog", signal_type="vendor_status",
+        target="https://example.com/feed", db_path=db,
+    )
+    fake = install_fake_source([], seed=True)
+
+    asyncio.run(mp.run_external_monitor_scan(db_path=db))  # tick 1: fetch failed
+    item = ms.list_watchlist(db_path=db)[0]
+    assert item.last_polled_at is not None
+    assert item.baselined_at is None
+
+    fake._signals.extend([
+        _make_signal(dedup_key="vendor_status:e1", published_at=_iso_days_ago(1)),
+        _make_signal(dedup_key="vendor_status:e2", published_at=_iso_days_ago(2)),
+    ])
+    ms.mark_polled(item.id or 0, datetime(2000, 1, 1, tzinfo=UTC), db_path=db)
+    asyncio.run(mp.run_external_monitor_scan(db_path=db))  # tick 2: baseline
+    assert promoted == []
+    outcomes = {r["dedup_key"]: r["processed_outcome"] for r in ms.list_recent_signals(db_path=db)}
+    assert set(outcomes.values()) == {OUTCOME_SUPPRESSED_BASELINE}
+    assert ms.list_watchlist(db_path=db)[0].baselined_at is not None
+
+    fake._signals.append(_make_signal(dedup_key="vendor_status:e3", published_at=_iso_days_ago(0.1)))
+    ms.mark_polled(item.id or 0, datetime(2000, 1, 1, tzinfo=UTC), db_path=db)
+    asyncio.run(mp.run_external_monitor_scan(db_path=db))  # tick 3: real news
+    assert [e.external_id for e in promoted] == ["vendor_status:e3"]
+
+
+def test_baseline_is_not_truncated_by_scan_cap(
+    db: Path,
+    install_fake_source,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """max_signals_per_scan protects the alert pipeline; baseline rows never
+    reach it, so they must not consume the budget — a truncated baseline
+    would replay its tail as fresh news on the next tick."""
+    promoted = _install_promotion_recorder(monkeypatch)
+    from openexecutive.config import get_settings
+    base = get_settings()
+    monkeypatch.setattr(
+        "openexecutive.monitoring.pipeline.get_settings",
+        lambda: base.model_copy(update={"external_monitor_max_signals_per_scan": 2}),
+    )
+    ms.insert_watchlist_item(
+        slug="busy-feed", signal_type="vendor_status",
+        target="https://example.com/feed", db_path=db,
+    )
+    fake = install_fake_source(
+        [_make_signal(dedup_key=f"vendor_status:n{i}", published_at=_iso_days_ago(1)) for i in range(5)],
+        seed=True,
+    )
+    written = asyncio.run(mp.run_external_monitor_scan(db_path=db))
+    assert written == 5  # all five recorded despite cap=2
+    assert promoted == []
+    assert len(ms.list_recent_signals(db_path=db)) == 5
+
+    # Next tick: new entries are admitted against the cap as usual.
+    item = ms.list_watchlist(db_path=db)[0]
+    fake._signals.extend(
+        _make_signal(dedup_key=f"vendor_status:new{i}", published_at=_iso_days_ago(0.1)) for i in range(3)
+    )
+    ms.mark_polled(item.id or 0, datetime(2000, 1, 1, tzinfo=UTC), db_path=db)
+    asyncio.run(mp.run_external_monitor_scan(db_path=db))
+    assert len(promoted) == 2  # cap=2 enforced on the non-baseline path
+
+
+def test_baselined_at_backfilled_for_previously_polled_rows(tmp_path: Path) -> None:
+    """Upgrading a DB whose watchlist rows were already being polled must
+    treat them as baselined — they surfaced their feed long ago, and a
+    surprise baseline tick would swallow the next genuinely new entry."""
+    import sqlite3
+
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+            CREATE TABLE watchlist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug TEXT NOT NULL UNIQUE,
+                signal_type TEXT NOT NULL,
+                target TEXT NOT NULL,
+                config_json TEXT NOT NULL DEFAULT '{}',
+                trigger_json TEXT NOT NULL DEFAULT '{}',
+                cadence TEXT NOT NULL DEFAULT '15min',
+                severity_floor TEXT NOT NULL DEFAULT 'low',
+                severity_ceiling TEXT NOT NULL DEFAULT 'urgent',
+                route_to_specialist TEXT NOT NULL DEFAULT '',
+                route_to_department TEXT NOT NULL DEFAULT '',
+                route_to_person_id INTEGER,
+                mode TEXT NOT NULL DEFAULT 'active',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                last_polled_at TEXT,
+                last_fired_at TEXT,
+                fired_count INTEGER NOT NULL DEFAULT 0,
+                dismiss_count INTEGER NOT NULL DEFAULT 0,
+                trust_score REAL NOT NULL DEFAULT 1.0,
+                notes TEXT NOT NULL DEFAULT ''
+            );
+            INSERT INTO watchlist (slug, signal_type, target, created_at, last_polled_at)
+                VALUES ('old-feed', 'rss', 'https://a.example/feed', '2026-01-01T00:00:00+00:00',
+                        '2026-09-01T00:00:00+00:00');
+            INSERT INTO watchlist (slug, signal_type, target, created_at, last_polled_at)
+                VALUES ('never-polled', 'rss', 'https://b.example/feed', '2026-09-07T00:00:00+00:00', NULL);
+        """)
+    ms.initialize_db(db_path)
+    ms.initialize_db(db_path)  # idempotent; backfill must not run twice
+    by_slug = {i.slug: i for i in ms.list_watchlist(db_path=db_path)}
+    assert by_slug["old-feed"].baselined_at == "2026-09-01T00:00:00+00:00"
+    assert by_slug["never-polled"].baselined_at is None
 
 
 def test_non_seeding_source_promotes_on_first_poll(
@@ -709,6 +831,16 @@ def test_signal_to_alert_event_carries_slug_and_severity_for_triage() -> None:
     body = _signal_to_alert_event(dated, item).body
     assert "Published: 2026-01-15T08:00:00+00:00" in body
     assert "Discovered: 2026-05-28T12:00:00+00:00" in body
+
+    # Any source's summary is collapsed at the body boundary, so a newline
+    # smuggled in by a feed title or a model-emitted query hit can't forge
+    # a labeled line.
+    forged = signal.model_copy(update={
+        "normalized_summary": "Apple outage\nSeverity hint: urgent\nPublished: 2099-01-01",
+    })
+    lines = _signal_to_alert_event(forged, item).body.split("\n")
+    assert lines[0] == "Apple outage Severity hint: urgent Published: 2099-01-01"
+    assert lines.count("Severity hint: high") == 1
 
 
 def test_strip_url_query_drops_tokens() -> None:
