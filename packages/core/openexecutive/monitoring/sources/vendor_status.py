@@ -34,7 +34,9 @@ incident, both #80 freshness gates become safe here:
   - the row is seeded on its first poll (``seed_on_first_poll``), with
     the incidents that are still OPEN exempted from the baseline by
     ``promote_on_baseline`` so a live outage surfaces immediately while
-    the resolved archive is recorded and never promoted;
+    the resolved archive is recorded and never promoted (openness is read
+    from the entry body, so it is only detectable on feeds that publish
+    per-update status labels — see ``promote_on_baseline``);
   - ``published_at`` is parsed from ``<updated>`` / ``<pubDate>``, so the
     age gate and the future-date deferral judge vendor incidents the same
     way they judge ``rss`` and ``edgar`` entries.
@@ -103,15 +105,28 @@ _OPEN_STATUSES = frozenset({
 })
 _CLOSED_STATUSES = frozenset({"resolved", "completed", "postmortem"})
 
-# Newest-update label in a Statuspage entry body. Bounded repetition, and
-# only over the head of the body (see _BODY_SCAN_CHARS), so a hostile feed
-# can't make this scan expensive.
-_STRONG_LABEL_RE = re.compile(r"<strong>\s*([^<>]{1,40}?)\s*</strong>", re.IGNORECASE)
+# Newest-update label in a Statuspage entry body. NO \s* padding around
+# the capture: \s is a subset of [^<>], so the two overlap and the engine
+# backtracks quadratically over a run of whitespace — a feed of entries
+# whose body is "<strong>" plus 8k spaces (well inside the 2MB fetch cap)
+# cost 3.4s PER ENTRY, synchronously, on the event loop the API serves
+# from. Whitespace is folded by _known_status anyway, so dropping the
+# padding is free: the same body now scans in ~0ms. Keep any future edit
+# to this pattern free of overlapping quantifiers.
+_STRONG_LABEL_RE = re.compile(r"<strong>([^<>]{1,40})</strong>", re.IGNORECASE)
 # Same label, in a body that carries no markup for us to key on — an
-# xhtml-typed Atom <content> (real child elements, so the tags never reach
-# us as text) or a plain-text update. Statuspage's own wording puts the
-# label first: "Resolved - The issue has been fixed."
-_TEXT_LABEL_RE = re.compile(r"^\s*([A-Za-z][A-Za-z ]{1,18}?)\s*[-–—:]\s", re.IGNORECASE)
+# xhtml-typed Atom <content> (real child elements, so the tags are consumed
+# by the parser and never reach us as text) or a plain-text update. NOT
+# anchored: itertext() glues the update's timestamp onto the label
+# ("Sep 7, 19:07 UTCInvestigating - looking into it."), so an anchored
+# pattern would never fire on a real body. Safety comes from the
+# vocabulary, not the position — only a label we already know can match,
+# and only when followed by Statuspage's " - " / ": " separator.
+_TEXT_LABEL_RE = re.compile(
+    r"(" + "|".join(re.escape(s) for s in sorted(_OPEN_STATUSES | _CLOSED_STATUSES))
+    + r")\s*[-–—:]\s",
+    re.IGNORECASE,
+)
 # AWS's rss/all.rss carries no per-update markup; it stamps the resolution
 # into the title instead ("Service is operating normally: [RESOLVED] …").
 _TITLE_MARKER_RE = re.compile(r"\[\s*(resolved|completed)\s*\]", re.IGNORECASE)
@@ -183,41 +198,47 @@ class VendorStatusSource:
             item.config_json.get("vendor_label")
             or _host_label(item.target)
         )
-        signals: list[Signal] = []
-        for entry in entries[:_MAX_ENTRIES_PER_FEED]:
-            entry_id = entry.get("id") or entry.get("link") or ""
-            if not entry_id:
-                # Without a stable upstream id we cannot dedup — skip
-                # rather than emit a noisy hash-of-title signal that
-                # would re-fire on every minor edit.
-                continue
-            title = collapse_whitespace(entry.get("title") or "") or "(untitled incident)"
-            summary = f"[{vendor_label}] {title}"
-            updated = entry.get("updated", "")
-            signals.append(Signal(
-                watchlist_id=item.id or 0,
-                source_kind=self.kind,
-                # The incident, not the state — two states of one incident
-                # share it, which is what makes an operator's "show me this
-                # incident" query work. Uniqueness lives on dedup_key.
-                source_external_id=entry_id[:500],
-                captured_at=datetime.now(UTC).isoformat(),
-                published_at=feed_text_published_at(updated),
-                normalized_summary=summary[:500],
-                raw_payload={
-                    "vendor_label": vendor_label,
-                    "target_url": item.target,
-                    "entry_id": entry_id,
-                    "title": title,
-                    "link": entry.get("link", ""),
-                    "updated": updated,
-                    "status": _latest_status(entry.get("body", ""), title),
-                },
-                provenance_url=entry.get("link") or item.target,
-                severity_hint=AlertSeverity.HIGH,
-                dedup_key=_make_dedup_key(item.slug, entry_id, updated),
-            ))
-        return signals
+        built = (
+            self._build_signal(entry, item, vendor_label)
+            for entry in entries[:_MAX_ENTRIES_PER_FEED]
+        )
+        return [signal for signal in built if signal is not None]
+
+    def _build_signal(
+        self, entry: dict[str, str], item: WatchlistItem, vendor_label: str,
+    ) -> Signal | None:
+        """One parsed feed entry → one Signal, or None when it can't dedup."""
+        entry_id = entry.get("id") or entry.get("link") or ""
+        if not entry_id:
+            # Without a stable upstream id we cannot dedup — skip rather
+            # than emit a noisy hash-of-title signal that would re-fire on
+            # every minor edit.
+            return None
+        title = collapse_whitespace(entry.get("title") or "") or "(untitled incident)"
+        updated = entry.get("updated", "")
+        return Signal(
+            watchlist_id=item.id or 0,
+            source_kind=self.kind,
+            # The incident, not the state — two states of one incident
+            # share it, which is what makes an operator's "show me this
+            # incident" query work. Uniqueness lives on dedup_key.
+            source_external_id=entry_id[:500],
+            captured_at=datetime.now(UTC).isoformat(),
+            published_at=feed_text_published_at(updated),
+            normalized_summary=f"[{vendor_label}] {title}"[:500],
+            raw_payload={
+                "vendor_label": vendor_label,
+                "target_url": item.target,
+                "entry_id": entry_id,
+                "title": title,
+                "link": entry.get("link", ""),
+                "updated": updated,
+                "status": _latest_status(entry.get("body", ""), title),
+            },
+            provenance_url=entry.get("link") or item.target,
+            severity_hint=AlertSeverity.HIGH,
+            dedup_key=_make_dedup_key(item.slug, entry_id, updated),
+        )
 
     def matches_trigger(self, signal: Signal, item: WatchlistItem) -> bool:
         """Optional keyword filter — see module docstring."""
@@ -241,6 +262,15 @@ class VendorStatusSource:
         archive at HIGH. Nothing is lost for good — that entry is recorded
         as baseline, and the next ``<updated>`` bump mints a new dedup key
         and surfaces normally.
+
+        That fail-closed default is the whole behaviour for a feed with no
+        per-update markup, AWS's ``rss/all.rss`` among them: its resolution
+        marker lives in the title, and an OPEN state there is only
+        inferable from the ABSENCE of one, which is exactly the guess this
+        refuses to make. So a watch on such a feed added mid-incident
+        baselines that incident and reports the vendor's next update
+        instead — AWS publishes one item per update, each with its own
+        guid, so that update is a new entry the baseline no longer covers.
         """
         return _is_open(str(signal.raw_payload.get("status") or ""))
 
@@ -338,15 +368,22 @@ def _latest_status(body: str, title: str) -> str:
     closed.
     """
     head = body[:_BODY_SCAN_CHARS]
-    for match in _STRONG_LABEL_RE.finditer(head):
-        label = _known_status(match.group(1))
-        if label:
-            return label
-    leading = _TEXT_LABEL_RE.match(head)
-    if leading:
-        label = _known_status(leading.group(1))
-        if label:
-            return label
+    newest = _STRONG_LABEL_RE.search(head)
+    if newest is not None:
+        # This vendor uses Statuspage's per-update markup, so the FIRST
+        # bold label is the newest update's — the incident's state right
+        # now — and it is the only one worth reading. An unrecognised
+        # label means we do not understand this feed: return "" and let
+        # the caller fail closed. Scanning past it to a later <strong>
+        # would report an OLDER state, and the older labels on an incident
+        # are nearly always open ones, so a resolved incident would come
+        # back "investigating" and promote itself out of the baseline.
+        return _known_status(newest.group(1))
+    # No per-update markup anywhere in the head: fall back to a known
+    # label in the body text, then to a title marker.
+    leading = _TEXT_LABEL_RE.search(head)
+    if leading is not None:
+        return _known_status(leading.group(1))
     marker = _TITLE_MARKER_RE.search(title)
     return marker.group(1).lower() if marker else ""
 
@@ -393,11 +430,20 @@ def _make_dedup_key(slug: str, entry_id: str, updated: str) -> str:
     unchanged feed still dedups (same id, same stamp), while an incident
     moving Investigating → Resolved mints a new key and surfaces.
 
+    The stamp is NORMALISED before hashing (the same parse that fills
+    ``published_at``), so the same instant spelled two ways — ``Z`` vs
+    ``+00:00``, ``GMT`` vs ``+0000`` — is one key. A vendor changing how
+    it serialises its dates must not rekey, and thereby re-alert, every
+    open incident it has. An unparseable stamp is hashed as-is.
+
     A feed that omits ``<updated>`` degrades to a stable per-incident key
     (the pre-#90 behaviour) rather than to one that changes every poll —
     an entry with no stamp has nothing to change, and a per-poll key
-    would re-alert forever.
+    would re-alert forever. A feed that regenerates a real stamp on every
+    request is the one shape this cannot defend against; nothing in the
+    promotion path rate-limits a row, so such a feed re-alerts each tick.
     """
-    payload = f"{slug}\x00{entry_id}\x00{updated}".encode()
+    stamp = feed_text_published_at(updated) or (updated or "").strip()
+    payload = f"{slug}\x00{entry_id}\x00{stamp}".encode()
     digest = hashlib.sha256(payload).hexdigest()[:32]
     return f"vendor_status:{digest}"

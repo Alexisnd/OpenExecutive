@@ -44,19 +44,6 @@ def _make_item(
     )
 
 
-def _install_feed(monkeypatch: pytest.MonkeyPatch, body: bytes) -> None:
-    async def fake_fetch(url: str, max_bytes: int) -> bytes:
-        return body
-
-    monkeypatch.setattr(
-        "openexecutive.monitoring.sources.vendor_status.fetch_bounded", fake_fetch
-    )
-    monkeypatch.setattr(
-        "openexecutive.monitoring.sources.vendor_status.validate_target_url",
-        lambda u: (True, ""),
-    )
-
-
 def _atom_entry(
     *, incident: str, title: str, updated: str, body: str,
 ) -> str:
@@ -168,12 +155,17 @@ _RESOLVED_BODY_TEXT = (
         ("<p><strong>Postmortem</strong> - write-up.</p>", "x", "postmortem"),
         # Case and whitespace are the vendor's business, not ours.
         ("<p><STRONG> resolved </STRONG> - done.</p>", "x", "resolved"),
-        # No markup at all: a label leading the body text still counts
+        # An unrecognised NEWEST label must NOT fall through to an older
+        # one: the older labels on an incident are nearly always open, so
+        # scanning on would report a resolved incident as investigating.
+        ("<p><strong>Fixed</strong> - all good.</p>"
+         "<p><strong>Investigating</strong> - looking into it.</p>", "x", ""),
+        # No markup at all: a known label in the body text still counts
         # (xhtml <content>, or a vendor publishing plain-text updates).
-        ("Investigating - we are looking into it.", "x", "investigating"),
+        # NOT anchored — itertext() glues the timestamp onto the label,
+        # which is what every real Statuspage body looks like here.
+        ("Sep 7, 19:07 UTCInvestigating - looking into it.", "x", "investigating"),
         ("Completed: the maintenance window is over.", "x", "completed"),
-        # …but only at the start; mid-body prose must not be mined for one.
-        ("We were monitoring - then it recovered.", "x", ""),
         # No per-update markup: fall back to the title marker (AWS).
         ("plain text body", "[RESOLVED] Increased error rates", "resolved"),
         # A <strong> that isn't a status label must not be mistaken for one.
@@ -254,10 +246,8 @@ def test_dedup_key_without_updated_is_stable_per_incident() -> None:
 
 
 @pytest.mark.asyncio
-async def test_poll_emits_status_published_at_and_keys(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_feed(monkeypatch, _SAMPLE_ATOM)
+async def test_poll_emits_status_published_at_and_keys(install_source_feed) -> None:
+    install_source_feed("vendor_status", _SAMPLE_ATOM)
     src = VendorStatusSource()
     item = _make_item(config={"vendor_label": "Stripe"})
 
@@ -280,12 +270,10 @@ async def test_poll_emits_status_published_at_and_keys(
 
 
 @pytest.mark.asyncio
-async def test_identical_poll_produces_identical_dedup_keys(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_identical_poll_produces_identical_dedup_keys(install_source_feed) -> None:
     """Re-polling an unchanged feed must dedup — the status page returns
     the same entries every five minutes."""
-    _install_feed(monkeypatch, _SAMPLE_ATOM)
+    install_source_feed("vendor_status", _SAMPLE_ATOM)
     src = VendorStatusSource()
     item = _make_item()
 
@@ -296,21 +284,19 @@ async def test_identical_poll_produces_identical_dedup_keys(
 
 
 @pytest.mark.asyncio
-async def test_incident_update_mints_a_new_key(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_incident_update_mints_a_new_key(install_source_feed) -> None:
     """Same incident, one status update later: a new key, so it re-fires."""
     src = VendorStatusSource()
     item = _make_item()
 
-    _install_feed(monkeypatch, _atom_feed(_OPEN_ENTRY))
+    install_source_feed("vendor_status", _atom_feed(_OPEN_ENTRY))
     before = (await src.poll(item))[0]
 
     resolved_now = _atom_entry(
         incident="2001", title="Elevated API error rates",
         updated="2026-09-07T13:05:00Z", body=_RESOLVED_BODY,
     )
-    _install_feed(monkeypatch, _atom_feed(resolved_now))
+    install_source_feed("vendor_status", _atom_feed(resolved_now))
     after = (await src.poll(item))[0]
 
     assert before.source_external_id == after.source_external_id
@@ -320,12 +306,10 @@ async def test_incident_update_mints_a_new_key(
 
 
 @pytest.mark.asyncio
-async def test_promote_on_baseline_exempts_only_open_incidents(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_promote_on_baseline_exempts_only_open_incidents(install_source_feed) -> None:
     """The first-poll contract: an open incident is live news, the resolved
     archive is not."""
-    _install_feed(monkeypatch, _SAMPLE_ATOM)
+    install_source_feed("vendor_status", _SAMPLE_ATOM)
     src = VendorStatusSource()
     item = _make_item()
 
@@ -337,16 +321,14 @@ async def test_promote_on_baseline_exempts_only_open_incidents(
 
 
 @pytest.mark.asyncio
-async def test_unknown_status_is_baselined_on_first_poll(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_unknown_status_is_baselined_on_first_poll(install_source_feed) -> None:
     """A feed whose format we don't recognise must not promote its archive.
     Nothing is lost: the next <updated> bump mints a new key."""
     unknown = _atom_entry(
         incident="9", title="Something happened",
         updated="2026-09-07T11:30:00Z", body="plain text, no markup",
     )
-    _install_feed(monkeypatch, _atom_feed(unknown))
+    install_source_feed("vendor_status", _atom_feed(unknown))
     src = VendorStatusSource()
     item = _make_item()
 
@@ -357,9 +339,9 @@ async def test_unknown_status_is_baselined_on_first_poll(
 
 
 @pytest.mark.asyncio
-async def test_rss_status_and_pubdate(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_rss_status_and_pubdate(install_source_feed) -> None:
     """Statuspage's RSS variant carries the same markup in <description>."""
-    _install_feed(monkeypatch, _SAMPLE_RSS)
+    install_source_feed("vendor_status", _SAMPLE_RSS)
     src = VendorStatusSource()
     item = _make_item(target="https://status.twilio.com/history.rss")
 
@@ -373,8 +355,8 @@ async def test_rss_status_and_pubdate(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_aws_rss_title_marker(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_feed(monkeypatch, _AWS_RSS)
+async def test_aws_rss_title_marker(install_source_feed) -> None:
+    install_source_feed("vendor_status", _AWS_RSS)
     src = VendorStatusSource()
     item = _make_item(target="https://status.aws.amazon.com/rss/all.rss")
 
@@ -386,12 +368,11 @@ async def test_aws_rss_title_marker(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_xhtml_content_still_yields_a_status(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_xhtml_content_still_yields_a_status(install_source_feed) -> None:
     """An Atom entry whose <content> holds real child elements (type=xhtml)
-    rather than escaped markup — findtext would return only the leading
-    text and lose the label."""
+    rather than escaped markup: findtext would return only the leading text
+    and lose the label, and itertext glues the update's timestamp onto the
+    label — so the text fallback must not be anchored at the start."""
     feed = b"""<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
   <entry>
@@ -399,11 +380,11 @@ async def test_xhtml_content_still_yields_a_status(
     <updated>2026-09-07T11:30:00Z</updated>
     <link rel="alternate" href="https://status.example.com/incidents/5"/>
     <title>Partial outage</title>
-    <content type="xhtml"><p><strong>Investigating</strong> - looking.</p></content>
+    <content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml"><p><small>Sep 7, 19:07 UTC</small><br/><strong>Investigating</strong> - looking.</p></div></content>
   </entry>
 </feed>
 """
-    _install_feed(monkeypatch, feed)
+    install_source_feed("vendor_status", feed)
     src = VendorStatusSource()
 
     signal = (await src.poll(_make_item()))[0]
@@ -412,9 +393,7 @@ async def test_xhtml_content_still_yields_a_status(
 
 
 @pytest.mark.asyncio
-async def test_entry_without_id_or_link_is_skipped(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_entry_without_id_or_link_is_skipped(install_source_feed) -> None:
     """Unchanged behaviour: no stable upstream id → no reliable dedup."""
     feed = b"""<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
@@ -424,15 +403,13 @@ async def test_entry_without_id_or_link_is_skipped(
   </entry>
 </feed>
 """
-    _install_feed(monkeypatch, feed)
+    install_source_feed("vendor_status", feed)
     assert await VendorStatusSource().poll(_make_item()) == []
 
 
 @pytest.mark.asyncio
-async def test_keyword_trigger_still_filters_on_title(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_feed(monkeypatch, _SAMPLE_ATOM)
+async def test_keyword_trigger_still_filters_on_title(install_source_feed) -> None:
+    install_source_feed("vendor_status", _SAMPLE_ATOM)
     src = VendorStatusSource()
     item = _make_item(trigger={"keywords": ["api"]})
 
@@ -440,3 +417,25 @@ async def test_keyword_trigger_still_filters_on_title(
 
     assert src.matches_trigger(live, item) is True
     assert src.matches_trigger(archived, item) is False
+
+
+def test_dedup_key_is_stable_across_date_spellings() -> None:
+    """The same instant spelled two ways is ONE key. A vendor changing how
+    it serialises dates must not rekey — and so re-alert — every open
+    incident it has."""
+    spellings = [
+        "2026-09-07T19:07:00Z",
+        "2026-09-07T19:07:00+00:00",
+        "2026-09-07T12:07:00-07:00",
+    ]
+    keys = {_make_dedup_key("vendor-x", "Incident/7", raw) for raw in spellings}
+    assert len(keys) == 1
+
+    rfc822 = {
+        _make_dedup_key("vendor-x", "Incident/7", raw)
+        for raw in ("Mon, 07 Sep 2026 19:07:00 GMT", "Mon, 07 Sep 2026 19:07:00 +0000")
+    }
+    assert rfc822 == keys  # …and the two dialects agree with each other
+
+    # An unparseable stamp is still hashed, so such a feed keeps working.
+    assert _make_dedup_key("vendor-x", "Incident/7", "whenever") != keys.pop()
